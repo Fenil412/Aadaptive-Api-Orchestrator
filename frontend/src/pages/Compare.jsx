@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   ResponsiveContainer, RadarChart, Radar, PolarGrid, PolarAngleAxis,
-  PolarRadiusAxis,
+  PolarRadiusAxis, Cell,
 } from 'recharts';
 import { GitCompare, Play } from 'lucide-react';
 import ChartCard from '../components/ChartCard';
@@ -172,10 +172,10 @@ export default function Compare() {
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
               <XAxis dataKey="name" stroke="#64748b" fontSize={10} />
               <YAxis stroke="#64748b" fontSize={11} domain={[0, 100]} />
-              <Tooltip contentStyle={tooltipStyle} />
+              <Tooltip contentStyle={tooltipStyle} formatter={v => [`${v.toFixed(1)}%`]} />
               <Bar dataKey="successRate" name="Success %" radius={[4, 4, 0, 0]}>
                 {barData.map((entry, i) => (
-                  <Bar key={i} fill={STRATEGY_COLORS[entry.fullName] || '#6366f1'} />
+                  <Cell key={i} fill={STRATEGY_COLORS[entry.fullName] || '#6366f1'} />
                 ))}
               </Bar>
             </BarChart>

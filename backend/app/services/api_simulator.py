@@ -5,7 +5,7 @@ import logging
 import random
 from typing import Any
 
-from app.utils.helpers import InvalidAPIError, SimulationError
+from app.utils.helpers import InvalidAPIError
 
 logger = logging.getLogger(__name__)
 
@@ -40,17 +40,11 @@ def simulate_api(api_name: str, retry: bool = False) -> dict[str, Any]:
 
     Raises:
         InvalidAPIError: Unknown api_name.
-        SimulationError: 5% global catastrophic failure chance.
     """
     if api_name not in API_CONFIG:
         raise InvalidAPIError(
             f"Unknown API: '{api_name}'. Valid: {list(API_CONFIG.keys())}"
         )
-
-    # 5% global catastrophic failure
-    if random.random() < 0.05:
-        logger.warning("Catastrophic failure triggered for api=%s", api_name)
-        raise SimulationError(f"Catastrophic failure while calling '{api_name}'")
 
     cfg = API_CONFIG[api_name]
     lat_min, lat_max = cfg["latency"]
@@ -58,14 +52,17 @@ def simulate_api(api_name: str, retry: bool = False) -> dict[str, Any]:
 
     latency = random.uniform(lat_min, lat_max) * system_load
     if retry:
+        latency *= 1.1   # +10% latency on retry (per spec)
         latency += 20.0
 
-    success = random.random() < cfg["success_prob"]
+    # Retry boosts success probability by 0.05 (per spec)
+    success_prob = min(1.0, cfg["success_prob"] + (0.05 if retry else 0.0))
+    success = random.random() < success_prob
 
     result = {
         "api_name": api_name,
         "latency": round(latency, 3),
-        "cost": cfg["cost"],
+        "cost": round(cfg["cost"] * (1.5 if retry else 1.0), 4),
         "success": success,
         "system_load": round(system_load, 4),
     }

@@ -42,6 +42,32 @@ class RLAgent:
             self._loaded = False
             logger.warning("RLAgent: failed to load model — %s. Using random fallback.", exc)
 
+    def _prepare_obs(self, state: list[float]) -> np.ndarray:
+        """
+        Normalise the state vector to match the model's observation space.
+
+        The PPO model is trained on rl_engine/env.py which uses a 6-dim state:
+          [latency, cost, success_rate, request_load, time_of_day, error_rate]
+
+        The app layer sends a 5-dim state:
+          [latency, cost, success_rate, system_load, previous_action_norm]
+
+        We pad to 6 dims by appending a neutral time_of_day value (0.5) when
+        the incoming state has fewer than 6 elements.
+        """
+        arr = list(state)
+        expected = None
+        if self._model is not None:
+            try:
+                expected = self._model.observation_space.shape[0]
+            except Exception:
+                pass
+        if expected and len(arr) < expected:
+            arr += [0.5] * (expected - len(arr))
+        elif expected and len(arr) > expected:
+            arr = arr[:expected]
+        return np.array(arr, dtype=np.float32).reshape(1, -1)
+
     def get_action(self, state: list[float]) -> str:
         """Return action label string. Falls back to random if model not loaded."""
         if not self._loaded or self._model is None:
@@ -50,7 +76,7 @@ class RLAgent:
             logger.warning("RLAgent: model not loaded, using random action %d", action_int)
             return ACTION_MAP[action_int]
 
-        obs = np.array(state, dtype=np.float32).reshape(1, -1)
+        obs = self._prepare_obs(state)
         action_int, _ = self._model.predict(obs, deterministic=True)
         return ACTION_MAP.get(int(action_int), "call_api")
 
@@ -67,7 +93,7 @@ class RLAgent:
 
         import torch
 
-        obs = np.array(state, dtype=np.float32).reshape(1, -1)
+        obs = self._prepare_obs(state)
         obs_tensor = torch.tensor(obs, dtype=torch.float32)
 
         with torch.no_grad():

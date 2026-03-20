@@ -1,57 +1,120 @@
+# ============================================================
 # Python
+# ============================================================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.egg
 *.egg-info/
 dist/
 build/
 .eggs/
-*.egg
+MANIFEST
 
-# Virtual Environment
+# ============================================================
+# Virtual Environments
+# ============================================================
 venv/
 env/
 .venv/
+.env/
+backend/venv/
 
-# RL Models (large files)
-backend/models/*.zip
-backend/models/*.pkl
-!backend/models/.gitkeep
-
-# Environment variables
+# ============================================================
+# Environment Variables
+# ============================================================
 .env
 backend/.env
 frontend/.env
+*.env.local
 
-# IDE
+# ============================================================
+# RL Model Artifacts (large binary files)
+# ============================================================
+backend/models/*.zip
+backend/models/*.pkl
+backend/models/ppo_api_orchestrator.zip
+backend/app/rl/model/*.zip
+backend/app/rl/model/*.pkl
+!backend/models/.gitkeep
+
+# ============================================================
+# Training Outputs
+# ============================================================
+backend/logs/
+backend/rl_engine/training_logs/
+tensorboard_logs/
+*.tfevents.*
+
+# ============================================================
+# Database Files
+# ============================================================
+*.db
+*.sqlite
+*.sqlite3
+backend/*.db
+
+# ============================================================
+# Node / Frontend
+# ============================================================
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+*.local
+
+# ============================================================
+# IDE / Editor
+# ============================================================
 .vscode/
 .idea/
 *.swp
 *.swo
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
 
+# ============================================================
 # OS
+# ============================================================
 .DS_Store
 Thumbs.db
 desktop.ini
+ehthumbs.db
 
-# Node
-node_modules/
-frontend/node_modules/
-frontend/dist/
-
-# Logs
-*.log
-logs/
-
-# Training outputs
-backend/rl_engine/training_logs/
-tensorboard_logs/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# pytest
+# ============================================================
+# Testing & Coverage
+# ============================================================
 .pytest_cache/
 htmlcov/
 .coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+.tox/
+
+# ============================================================
+# Jupyter
+# ============================================================
+.ipynb_checkpoints/
+*.ipynb
+
+# ============================================================
+# Logs
+# ============================================================
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ============================================================
+# Build / Distribution
+# ============================================================
+*.pyc
+*.pyo
+*.pyd

@@ -14,7 +14,7 @@ from app.services.db_service import (
     fetch_rl_decisions, fetch_training_metrics,
     insert_api_log, insert_rl_decision,
 )
-from app.utils.helpers import InvalidAPIError, SimulationError, compute_reward
+from app.utils.helpers import InvalidAPIError, compute_reward
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/rl", tags=["RL Agent"])
@@ -65,8 +65,6 @@ async def execute_pipeline(body: StateInput, db: AsyncSession = Depends(get_db))
         sim_result = simulate_api(body.api_name, retry=retry)
     except InvalidAPIError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except SimulationError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     reward = compute_reward(sim_result, action_int)
     logged = False
