@@ -5,13 +5,17 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from app.config.database import SessionLocal
-from app.models.db_models import APILog, RLDecision, TrainingMetrics
+from app.config.database import SessionLocal, Base, engine
+from app.models.db_models import APILog, RLDecision, TrainingMetrics, TrainingRun, EvaluationResult
 from app.services.api_simulator import API_ECOSYSTEM
 from app.utils.helpers import action_to_string
 import json
 
 def seed_database(num_logs=500, num_decisions=500, num_metrics=100):
+    print("Rebuilding database schema securely...")
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    
     db = SessionLocal()
     
     print("Seeding database...")
@@ -95,6 +99,38 @@ def seed_database(num_logs=500, num_decisions=500, num_metrics=100):
         
     db.commit()
     print(f"Inserted {num_metrics} Training Metrics lines.")
+
+    # Generate Training Runs
+    run = TrainingRun(
+        total_episodes=num_metrics,
+        best_reward=total_reward, # last highest reward in logic
+        model_path="/rl/model/ppo_model.zip",
+        timestamp=now
+    )
+    db.add(run)
+    db.commit()
+    print("Inserted 1 Training Run.")
+
+    # Generate Evaluation Results
+    evals = [
+        {"strategy": "PPO RL", "score": 95, "success_rate": 0.98, "avg_latency": 120, "avg_cost": 0.05},
+        {"strategy": "Fastest", "score": 80, "success_rate": 0.95, "avg_latency": 50, "avg_cost": 0.20},
+        {"strategy": "Cheapest", "score": 75, "success_rate": 0.85, "avg_latency": 500, "avg_cost": 0.01},
+        {"strategy": "Balanced", "score": 88, "success_rate": 0.92, "avg_latency": 250, "avg_cost": 0.10},
+    ]
+
+    for ev in evals:
+        result = EvaluationResult(
+            strategy=ev["strategy"],
+            avg_reward=ev["score"],
+            avg_latency=ev["avg_latency"],
+            avg_cost=ev["avg_cost"],
+            success_rate=ev["success_rate"],
+            timestamp=now
+        )
+        db.add(result)
+    db.commit()
+    print("Inserted 4 Evaluation Results.")
     
     db.close()
     print("Database seeding completed.")

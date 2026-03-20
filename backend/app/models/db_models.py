@@ -28,5 +28,23 @@ class TrainingMetrics(Base):
     success_rate = Column(Float)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
+class TrainingRun(Base):
+    __tablename__ = "training_runs"
+    id = Column(Integer, primary_key=True, index=True)
+    total_episodes = Column(Integer)
+    best_reward = Column(Float)
+    model_path = Column(String)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+class EvaluationResult(Base):
+    __tablename__ = "evaluation_results"
+    id = Column(Integer, primary_key=True, index=True)
+    strategy = Column(String)
+    avg_reward = Column(Float)
+    avg_latency = Column(Float)
+    avg_cost = Column(Float)
+    success_rate = Column(Float)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
 # Initialize tables
 Base.metadata.create_all(bind=engine)
