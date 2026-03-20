@@ -132,8 +132,9 @@ class APIRoutingEnv(gym.Env):
         Simulate the outcome of routing a request to the chosen provider,
         given current system conditions.
         """
+        action = int(action)  # Ensure plain int (model.predict returns numpy)
         profile = PROVIDER_PROFILES[action]
-        request_load = state[3]  # current load affects all providers
+        request_load = float(state[3])  # current load affects all providers
 
         # ── Latency: base range + load impact ──
         lat_low, lat_high = profile["latency_range"]
@@ -203,6 +204,7 @@ class APIRoutingEnv(gym.Env):
         Returns:
             observation, reward, terminated, truncated, info
         """
+        action = int(action)  # Ensure plain int (model.predict returns numpy)
         self.current_step += 1
 
         # Simulate provider response
