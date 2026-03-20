@@ -1,20 +1,35 @@
-from pydantic import BaseModel
-from typing import Optional, Any
+"""Response Pydantic schemas for the app/ FastAPI layer."""
+from datetime import datetime
 
-class APILogResponse(BaseModel):
-    id: int
+from pydantic import BaseModel
+
+
+class APIResponse(BaseModel):
     api_name: str
     latency: float
     cost: float
     success: bool
-    timestamp: Any
+    system_load: float
 
-class RLDecisionResponse(BaseModel):
-    action: int
-    action_name: str
+
+class DecisionResponse(BaseModel):
+    action: str
+    action_int: int
+    confidence: dict[str, float]
+
 
 class ExecuteResponse(BaseModel):
-    action: int
-    action_name: str
-    api_response: dict
+    action_taken: str
+    api_result: APIResponse
     reward: float
+    logged: bool
+    timestamp: datetime
+
+
+class DashboardResponse(BaseModel):
+    total_calls: int
+    success_rate: float
+    avg_latency: float
+    avg_cost: float
+    top_api: str
+    recent_decisions: list[dict]

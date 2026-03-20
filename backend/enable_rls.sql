@@ -1,33 +1,49 @@
--- ==========================================
--- SUPABASE ROW LEVEL SECURITY (RLS) SETUP
--- ==========================================
--- Copy and run this script inside your Supabase 
--- SQL Editor to properly secure your tables and 
--- remove the Security Advisor warnings.
+-- PostgreSQL Row Level Security policies
+-- Run as superuser after creating tables via schema.sql
 
--- 1. Enable RLS on all tables
-ALTER TABLE IF EXISTS api_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE IF EXISTS rl_decisions ENABLE ROW LEVEL SECURITY;
-ALTER TABLE IF EXISTS training_metrics ENABLE ROW LEVEL SECURITY;
+-- ---------------------------------------------------------------
+-- Enable RLS on all tables
+-- ---------------------------------------------------------------
+ALTER TABLE api_logs        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE rl_decisions    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE training_metrics ENABLE ROW LEVEL SECURITY;
 
--- If you still have old schema tables laying around, secure them too:
-ALTER TABLE IF EXISTS training_runs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE IF EXISTS evaluation_results ENABLE ROW LEVEL SECURITY;
+-- ---------------------------------------------------------------
+-- api_logs policies
+-- ---------------------------------------------------------------
+-- Allow authenticated users to read all logs
+CREATE POLICY api_logs_select_policy ON api_logs
+    FOR SELECT
+    USING (true);
 
--- 2. Create basic Service Role bypass policies.
--- (This ensures the FastAPI backend can still easily read/write data 
--- using the Postgres connection string without being blocked, 
--- while preventing anonymous internet users from doing so.)
-CREATE POLICY "Allow full access to service_role on api_logs" ON api_logs
-    USING ( auth.role() = 'service_role' OR auth.role() = 'postgres' )
-    WITH CHECK ( auth.role() = 'service_role' OR auth.role() = 'postgres' );
+-- Allow authenticated users to insert their own logs
+CREATE POLICY api_logs_insert_policy ON api_logs
+    FOR INSERT
+    WITH CHECK (true);
 
-CREATE POLICY "Allow full access to service_role on rl_decisions" ON rl_decisions
-    USING ( auth.role() = 'service_role' OR auth.role() = 'postgres' )
-    WITH CHECK ( auth.role() = 'service_role' OR auth.role() = 'postgres' );
+-- ---------------------------------------------------------------
+-- rl_decisions policies
+-- ---------------------------------------------------------------
+CREATE POLICY rl_decisions_select_policy ON rl_decisions
+    FOR SELECT
+    USING (true);
 
-CREATE POLICY "Allow full access to service_role on training_metrics" ON training_metrics
-    USING ( auth.role() = 'service_role' OR auth.role() = 'postgres' )
-    WITH CHECK ( auth.role() = 'service_role' OR auth.role() = 'postgres' );
+CREATE POLICY rl_decisions_insert_policy ON rl_decisions
+    FOR INSERT
+    WITH CHECK (true);
 
--- You are completely secure now!
+-- ---------------------------------------------------------------
+-- training_metrics policies
+-- ---------------------------------------------------------------
+CREATE POLICY training_metrics_select_policy ON training_metrics
+    FOR SELECT
+    USING (true);
+
+CREATE POLICY training_metrics_insert_policy ON training_metrics
+    FOR INSERT
+    WITH CHECK (true);
+
+-- ---------------------------------------------------------------
+-- Grant privileges to application role (replace 'app_user' as needed)
+-- ---------------------------------------------------------------
+-- GRANT SELECT, INSERT ON api_logs, rl_decisions, training_metrics TO app_user;

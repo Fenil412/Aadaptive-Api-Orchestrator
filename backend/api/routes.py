@@ -1,448 +1,179 @@
 """
-FastAPI route handlers for the Adaptive API Orchestrator.
-
-Endpoints:
-    GET  /                    - Health check
-    POST /simulate-api        - Simulate a single API routing decision
-    POST /simulate-run        - Run a full simulation episode
-    GET  /get-decision        - Get RL decision for given state
-    POST /train               - Train/retrain the RL model
-    GET  /training-metrics    - Get training metrics for graphs
-    GET  /evaluation-results  - Get RL vs static comparison
-    GET  /api-logs            - Fetch API logs
-    GET  /rl-decisions        - Fetch RL decisions
-    GET  /dashboard-stats     - Get dashboard summary
+Primary API router — all route handlers for the api/ app.
+Run from backend/ directory: uvicorn api.main:app --port 8000 --reload
 """
-
-import os
-import sys
 import json
-import numpy as np
-from datetime import datetime
-from typing import Optional
+import logging
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Query
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from api.models import APICallRequest, HealthResponse
 
-from stable_baselines3 import PPO
-from rl_engine.env import APIRoutingEnv, PROVIDER_PROFILES
-from api.models import (
-    SimulateAPIRequest,
-    TrainRequest,
-    DecisionResponse,
-    SimulationResponse,
-    SimulationRunResponse,
-    TrainingStatusResponse,
-    HealthResponse,
-    MetricsResponse,
-    DashboardStats,
-)
-
-# Try to import DB functions (graceful fallback if DB not configured)
-try:
-    from db.connection import (
-        insert_api_log,
-        get_api_logs,
-        get_api_logs_count,
-        insert_rl_decision,
-        get_rl_decisions,
-        get_dashboard_stats,
-        get_evaluation_results,
-    )
-    DB_AVAILABLE = True
-except Exception:
-    DB_AVAILABLE = False
-    print("⚠️  Database not configured, running in memory-only mode")
-
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# ── Global state ──
-_model = None
-_env = None
-_in_memory_logs = []  # Fallback when DB is unavailable
-_in_memory_decisions = []
+MODELS_DIR = Path(__file__).parents[1] / "models"
+METRICS_PATH = MODELS_DIR / "training_metrics.json"
 
-MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
-MODEL_PATH = os.path.join(MODEL_DIR, "ppo_api_orchestrator.zip")
+_ppo_model = None
+_rl_env = None
+_in_memory_logs: list[dict] = []
 
-
-def _load_model():
-    """Load the trained RL model (lazy loading)."""
-    global _model
-    if _model is None:
-        if os.path.exists(MODEL_PATH):
-            _model = PPO.load(MODEL_PATH)
-            print(f"✅ Model loaded from: {MODEL_PATH}")
-        else:
-            print(f"⚠️  No trained model found at: {MODEL_PATH}")
-    return _model
+try:
+    from db.connection import get_db_connection as _get_db  # noqa: F401
+    _db_available = True
+except Exception as _e:
+    logger.warning("DB layer unavailable: %s", _e)
+    _db_available = False
 
 
-def _get_env():
-    """Get or create the environment instance."""
-    global _env
-    if _env is None:
-        _env = APIRoutingEnv()
-    return _env
+def _get_env_and_model():
+    global _ppo_model, _rl_env
+    if _ppo_model is None:
+        try:
+            from stable_baselines3 import PPO
+            model_path = os.getenv("MODEL_PATH", str(MODELS_DIR / "ppo_api_orchestrator.zip"))
+            _ppo_model = PPO.load(model_path)
+            logger.info("PPO model loaded from %s", model_path)
+        except Exception as exc:
+            logger.warning("PPO model not loaded: %s", exc)
+            _ppo_model = None
+
+    if _rl_env is None:
+        try:
+            from rl_engine.env import APIRoutingEnv
+            _rl_env = APIRoutingEnv()
+            _rl_env.reset()
+        except Exception as exc:
+            logger.warning("RL env not initialized: %s", exc)
+            _rl_env = None
+
+    return _rl_env, _ppo_model
 
 
-# ═══════════════════════════════════════════
-# ENDPOINTS
-# ═══════════════════════════════════════════
-
-@router.get("/", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint."""
-    model = _load_model()
-    return HealthResponse(
-        status="healthy",
-        model_loaded=model is not None,
-        timestamp=datetime.now().isoformat(),
-    )
+@router.get("/", tags=["Health"])
+async def root() -> dict[str, Any]:
+    _, model = _get_env_and_model()
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "db_available": _db_available,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
-@router.post("/simulate-api", response_model=SimulationResponse)
-async def simulate_api(request: SimulateAPIRequest):
-    """
-    Simulate a single API routing decision.
-    Uses the RL model to decide which provider to route to.
-    """
-    model = _load_model()
+@router.post("/simulate-api", tags=["Simulation"])
+async def simulate_api_endpoint(body: APICallRequest) -> dict[str, Any]:
+    import numpy as np
+
+    env, model = _get_env_and_model()
+
     if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="No trained model available. Train the model first via POST /train",
-        )
+        raise HTTPException(status_code=503, detail="Model not loaded. Run POST /train first.")
 
-    env = _get_env()
-
-    # Build state from request
     state = np.array(
-        [
-            request.current_latency,
-            request.current_cost,
-            request.success_rate,
-            request.request_load,
-            request.time_of_day,
-            request.error_rate,
-        ],
+        [body.latency, body.cost, body.success_rate, body.request_load, body.time_of_day, body.error_rate],
         dtype=np.float32,
     )
-
-    # Get RL decision
-    action, _ = model.predict(state, deterministic=True)
+    action, _ = model.predict(state.reshape(1, -1), deterministic=True)
     action = int(action)
 
-    # Simulate the outcome
-    latency, cost, success = env._simulate_provider_response(action, state)
-    reward = env._calculate_reward(latency, cost, success)
-    provider_name = PROVIDER_PROFILES[action]["name"]
+    provider_names = {0: "Provider_A", 1: "Provider_B", 2: "Provider_C", 3: "Fallback"}
+    provider = provider_names.get(action, "Unknown")
 
-    # Log to DB or memory
-    state_list = state.tolist()
-    if DB_AVAILABLE:
-        insert_api_log(action, provider_name, latency, cost, success, reward, state_list)
+    if env is not None:
+        env.reset()
+        obs, reward, _, _, info = env.step(action)
+        latency = info.get("latency", body.latency)
+        cost = info.get("cost", body.cost)
+        success = info.get("success", True)
     else:
-        _in_memory_logs.append({
-            "timestamp": datetime.now().isoformat(),
-            "action": action,
-            "provider": provider_name,
-            "latency": float(latency),
-            "cost": float(cost),
-            "success": bool(success),
-            "reward": float(reward),
-            "state": state_list,
-        })
+        import random
+        latency, cost = body.latency, body.cost
+        success = random.random() > 0.1
+        reward = 0.3 * (1 - latency) + 0.3 * (1 - cost) + 0.4 * float(success) - 1.0 * float(not success)
 
-    return SimulationResponse(
-        step=len(_in_memory_logs) if not DB_AVAILABLE else 0,
-        action=action,
-        provider=provider_name,
-        latency=float(latency),
-        cost=float(cost),
-        success=bool(success),
-        reward=float(reward),
-        state=state_list,
-    )
+    result = {
+        "action": action,
+        "provider": provider,
+        "latency": latency,
+        "cost": cost,
+        "success": success,
+        "reward": reward,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "state": state.tolist(),
+    }
+    _in_memory_logs.append(result)
+    if len(_in_memory_logs) > 1000:
+        _in_memory_logs.pop(0)
+    return result
 
 
-@router.post("/simulate-run", response_model=SimulationRunResponse)
-async def simulate_run(num_steps: int = Query(default=50, ge=1, le=500)):
-    """
-    Run a full simulation of multiple steps.
-    Uses the RL model to make decisions at each step.
-    """
-    model = _load_model()
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="No trained model available. Train the model first.",
-        )
-
-    env = _get_env()
-    obs, _ = env.reset()
-    steps = []
-
-    for i in range(num_steps):
-        action, _ = model.predict(obs, deterministic=True)
-        action = int(action)
-        obs, reward, terminated, truncated, info = env.step(action)
-
-        step_data = SimulationResponse(
-            step=i + 1,
-            action=action,
-            provider=info["provider"],
-            latency=float(info["latency"]),
-            cost=float(info["cost"]),
-            success=bool(info["success"]),
-            reward=float(info["reward"]),
-            state=obs.tolist(),
-        )
-        steps.append(step_data)
-
-        # Log to DB
-        if DB_AVAILABLE:
-            insert_api_log(
-                action, info["provider"],
-                info["latency"], info["cost"],
-                info["success"], info["reward"],
-                obs.tolist(),
-            )
-
-        if terminated or truncated:
-            break
-
-    summary = env.get_episode_summary()
-
-    return SimulationRunResponse(steps=steps, summary=summary)
+@router.get("/training-metrics", tags=["Training"])
+async def get_training_metrics() -> dict[str, Any]:
+    if METRICS_PATH.exists():
+        try:
+            with open(METRICS_PATH) as f:
+                return json.load(f)
+        except Exception as exc:
+            logger.error("Failed to read training_metrics.json: %s", exc)
+    return {"error": "No training metrics found. Run POST /train first."}
 
 
-@router.get("/get-decision", response_model=DecisionResponse)
-async def get_decision(
-    latency: float = Query(default=0.5, ge=0, le=1),
-    cost: float = Query(default=0.5, ge=0, le=1),
-    success_rate: float = Query(default=0.8, ge=0, le=1),
-    load: float = Query(default=0.5, ge=0, le=1),
-    time: float = Query(default=0.5, ge=0, le=1),
-    error_rate: float = Query(default=0.1, ge=0, le=1),
-):
-    """
-    Get an RL routing decision for the given system state.
-    Returns the chosen provider and expected outcome.
-    """
-    model = _load_model()
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="No trained model available.",
-        )
-
-    env = _get_env()
-    state = np.array(
-        [latency, cost, success_rate, load, time, error_rate],
-        dtype=np.float32,
-    )
-
-    action, _ = model.predict(state, deterministic=True)
-    action = int(action)
-
-    # Simulate outcome
-    result_latency, result_cost, success = env._simulate_provider_response(action, state)
-    reward = env._calculate_reward(result_latency, result_cost, success)
-    profile = PROVIDER_PROFILES[action]
-
-    return DecisionResponse(
-        action=action,
-        provider={
-            "id": action,
-            "name": profile["name"],
-            "latency": float(result_latency),
-            "cost": float(result_cost),
-            "success": bool(success),
-        },
-        reward=float(reward),
-        state=state.tolist(),
-        timestamp=datetime.now().isoformat(),
-    )
-
-
-@router.post("/train", response_model=TrainingStatusResponse)
-async def train_model(request: TrainRequest):
-    """
-    Train or retrain the RL model.
-    WARNING: This is a blocking operation that may take a while.
-    """
-    global _model
-
+@router.post("/train", tags=["Training"])
+async def trigger_training(
+    timesteps: int = Query(default=50_000, ge=1_000, le=500_000),
+) -> dict[str, Any]:
     try:
-        from rl_engine.train import train_model as do_train
-
-        os.makedirs(MODEL_DIR, exist_ok=True)
-        _model = do_train(
-            total_timesteps=request.timesteps,
-            save_dir=MODEL_DIR,
-            model_name="ppo_api_orchestrator",
-            learning_rate=request.learning_rate,
-        )
-
-        return TrainingStatusResponse(
-            status="completed",
-            message=f"Model trained for {request.timesteps} timesteps",
-            model_path=MODEL_PATH,
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Training failed: {str(e)}",
-        )
+        from rl_engine.train import train_model
+        metrics = train_model(total_timesteps=timesteps)
+        global _ppo_model
+        _ppo_model = None
+        _get_env_and_model()
+        return {"status": "completed", "metrics": metrics}
+    except Exception as exc:
+        logger.error("Training failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@router.get("/training-metrics", response_model=MetricsResponse)
-async def get_training_metrics():
-    """Get training metrics for visualization."""
-    metrics_path = os.path.join(MODEL_DIR, "training_metrics.json")
-
-    if not os.path.exists(metrics_path):
-        # Return empty metrics
-        return MetricsResponse(
-            timesteps=[],
-            mean_rewards=[],
-            mean_latencies=[],
-            mean_costs=[],
-            success_rates=[],
-        )
-
-    with open(metrics_path, "r") as f:
-        data = json.load(f)
-
-    return MetricsResponse(
-        timesteps=data.get("timesteps", []),
-        mean_rewards=data.get("mean_rewards", []),
-        mean_latencies=data.get("mean_latencies", []),
-        mean_costs=data.get("mean_costs", []),
-        success_rates=data.get("success_rates", []),
-    )
+@router.get("/api-logs", tags=["Logs"])
+async def get_api_logs(limit: int = Query(default=100, ge=1, le=1000)) -> list[dict]:
+    return _in_memory_logs[-limit:][::-1]
 
 
-@router.get("/evaluation-results")
-async def evaluation_results():
-    """Get RL vs static strategy comparison results."""
-    # Try from DB first
-    if DB_AVAILABLE:
-        results = get_evaluation_results()
-        if results:
-            return results
-
-    # Fallback to file
-    results_path = os.path.join(MODEL_DIR, "evaluation_results.json")
-    if os.path.exists(results_path):
-        with open(results_path, "r") as f:
-            return json.load(f)
-
-    return {"message": "No evaluation results available. Run evaluation first."}
-
-
-@router.get("/api-logs")
-async def fetch_api_logs(
-    limit: int = Query(default=100, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
-):
-    """Fetch API routing logs."""
-    if DB_AVAILABLE:
-        return get_api_logs(limit, offset)
-
-    # In-memory fallback
-    start = offset
-    end = offset + limit
-    return _in_memory_logs[start:end][::-1]  # newest first
-
-
-@router.get("/rl-decisions")
-async def fetch_rl_decisions(limit: int = Query(default=100, ge=1, le=1000)):
-    """Fetch RL decision records."""
-    if DB_AVAILABLE:
-        return get_rl_decisions(limit)
-
-    return _in_memory_decisions[:limit]
-
-
-@router.get("/dashboard-stats", response_model=DashboardStats)
-async def dashboard_stats():
-    """Get aggregated dashboard statistics."""
-    if DB_AVAILABLE:
-        stats = get_dashboard_stats()
-        return DashboardStats(**stats)
-
-    # Compute from in-memory logs
-    if not _in_memory_logs:
-        return DashboardStats(
-            total_decisions=0,
-            avg_reward=0,
-            avg_latency=0,
-            avg_cost=0,
-            success_rate=0,
-            provider_distribution={},
-            recent_trend="stable",
-        )
-
+@router.get("/dashboard-stats", tags=["Dashboard"])
+async def dashboard_stats() -> dict[str, Any]:
+    import numpy as np
     logs = _in_memory_logs
-    provider_dist = {}
-    for log in logs:
-        p = log["provider"]
-        provider_dist[p] = provider_dist.get(p, 0) + 1
-
-    return DashboardStats(
-        total_decisions=len(logs),
-        avg_reward=np.mean([l["reward"] for l in logs]),
-        avg_latency=np.mean([l["latency"] for l in logs]),
-        avg_cost=np.mean([l["cost"] for l in logs]),
-        success_rate=np.mean([float(l["success"]) for l in logs]),
-        provider_distribution=provider_dist,
-        recent_trend="stable",
-    )
+    if not logs:
+        return {"total_calls": 0, "success_rate": 0.0, "avg_latency": 0.0, "avg_cost": 0.0, "avg_reward": 0.0}
+    return {
+        "total_calls": len(logs),
+        "success_rate": float(np.mean([1.0 if l.get("success") else 0.0 for l in logs])),
+        "avg_latency": float(np.mean([l.get("latency", 0.0) for l in logs])),
+        "avg_cost": float(np.mean([l.get("cost", 0.0) for l in logs])),
+        "avg_reward": float(np.mean([l.get("reward", 0.0) for l in logs])),
+    }
 
 
-@router.post("/evaluate")
-async def run_evaluation(episodes: int = Query(default=20, ge=5, le=100)):
-    """Run evaluation comparing RL agent against static strategies."""
-    model = _load_model()
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail="No trained model available.",
-        )
-
+@router.post("/evaluate", tags=["Evaluation"])
+async def run_evaluation(n_episodes: int = Query(default=20, ge=1, le=200)) -> dict[str, Any]:
     try:
+        model_path = os.getenv("MODEL_PATH", str(MODELS_DIR / "ppo_api_orchestrator.zip"))
         from rl_engine.evaluate import evaluate_model
+        return evaluate_model(model_path, n_episodes=n_episodes, save_dir=str(MODELS_DIR))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-        results = evaluate_model(
-            model_path=MODEL_PATH,
-            n_episodes=episodes,
-            save_dir=MODEL_DIR,
-        )
 
-        # Save to DB if available
-        if DB_AVAILABLE:
-            for strategy_name, data in results.items():
-                insert_evaluation_result(
-                    strategy_name,
-                    data["avg_episode_reward"],
-                    data["avg_latency"],
-                    data["avg_cost"],
-                    data["success_rate"],
-                    episodes,
-                )
-
-        # Return serializable results
-        return {
-            name: {
-                k: v for k, v in data.items()
-                if k != "episode_rewards"
-            }
-            for name, data in results.items()
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Evaluation failed: {str(e)}",
-        )
+@router.get("/evaluation-results", tags=["Evaluation"])
+async def get_evaluation_results() -> dict[str, Any]:
+    eval_path = MODELS_DIR / "evaluation_results.json"
+    if eval_path.exists():
+        with open(eval_path) as f:
+            return json.load(f)
+    return {"error": "No evaluation results found. Run POST /evaluate first."}

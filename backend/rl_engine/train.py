@@ -1,236 +1,121 @@
 """
-Training script for the API Routing RL agent.
-
-Uses PPO (Proximal Policy Optimization) from Stable-Baselines3.
-Trains on the custom APIRoutingEnv and saves the model.
+Standalone PPO training script for rl_engine.
+Run from backend/ directory:
+    python -m rl_engine.train
 """
-
-import os
-import sys
 import json
+import logging
+import time
+from pathlib import Path
+
 import numpy as np
-from datetime import datetime
-
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv
+
 from rl_engine.env import APIRoutingEnv
 
+logger = logging.getLogger(__name__)
 
-class TrainingMetricsCallback(BaseCallback):
-    """
-    Custom callback to log training metrics at regular intervals.
-    Saves metrics to a JSON file for visualization.
-    """
+MODELS_DIR = Path(__file__).parents[1] / "models"
+MODEL_SAVE_PATH = MODELS_DIR / "ppo_api_orchestrator.zip"
+METRICS_SAVE_PATH = MODELS_DIR / "training_metrics.json"
+LOG_DIR = Path(__file__).parents[1] / "logs" / "rl_engine"
+TOTAL_TIMESTEPS = 50_000
+EVAL_FREQ = 5_000
 
-    def __init__(self, log_interval=1000, save_path="./models", verbose=1):
-        super().__init__(verbose)
-        self.log_interval = log_interval
-        self.save_path = save_path
-        self.metrics = {
-            "timestamps": [],
-            "timesteps": [],
-            "mean_rewards": [],
-            "mean_latencies": [],
-            "mean_costs": [],
-            "success_rates": [],
-        }
-        self._episode_rewards = []
-        self._episode_latencies = []
-        self._episode_costs = []
-        self._episode_successes = []
+
+class _EpisodeCallback(BaseCallback):
+    def __init__(self, eval_freq: int = EVAL_FREQ):
+        super().__init__(verbose=0)
+        self.eval_freq = eval_freq
+        self.episodes: list[dict] = []
+        self._ep_count = 0
 
     def _on_step(self) -> bool:
-        # Collect info from the environment
-        infos = self.locals.get("infos", [])
-        for info in infos:
-            if "reward" in info:
-                self._episode_rewards.append(info["reward"])
-            if "latency" in info:
-                self._episode_latencies.append(info["latency"])
-            if "cost" in info:
-                self._episode_costs.append(info["cost"])
-            if "success" in info:
-                self._episode_successes.append(float(info["success"]))
-
-        if self.num_timesteps % self.log_interval == 0 and self._episode_rewards:
-            mean_reward = np.mean(self._episode_rewards[-100:])
-            mean_latency = np.mean(self._episode_latencies[-100:])
-            mean_cost = np.mean(self._episode_costs[-100:])
-            success_rate = np.mean(self._episode_successes[-100:])
-
-            self.metrics["timestamps"].append(datetime.now().isoformat())
-            self.metrics["timesteps"].append(self.num_timesteps)
-            self.metrics["mean_rewards"].append(float(mean_reward))
-            self.metrics["mean_latencies"].append(float(mean_latency))
-            self.metrics["mean_costs"].append(float(mean_cost))
-            self.metrics["success_rates"].append(float(success_rate))
-
-            if self.verbose:
-                print(
-                    f"  [Step {self.num_timesteps:6d}] "
-                    f"Reward: {mean_reward:+.3f} | "
-                    f"Latency: {mean_latency:.3f} | "
-                    f"Cost: {mean_cost:.3f} | "
-                    f"Success: {success_rate:.1%}"
-                )
-
+        for info in self.locals.get("infos", []):
+            if "episode" in info:
+                self._ep_count += 1
+                self.episodes.append({
+                    "episode": self._ep_count,
+                    "reward": float(info["episode"]["r"]),
+                    "length": int(info["episode"]["l"]),
+                })
+                if self._ep_count % 10 == 0:
+                    logger.info(
+                        "Episode %d — reward: %.2f, length: %d",
+                        self._ep_count, info["episode"]["r"], info["episode"]["l"],
+                    )
         return True
-
-    def _on_training_end(self) -> None:
-        # Save training metrics
-        metrics_path = os.path.join(self.save_path, "training_metrics.json")
-        with open(metrics_path, "w") as f:
-            json.dump(self.metrics, f, indent=2)
-        if self.verbose:
-            print(f"\n📊 Training metrics saved to: {metrics_path}")
 
 
 def train_model(
-    total_timesteps=10000,
-    save_dir="./models",
-    model_name="ppo_api_orchestrator",
-    learning_rate=3e-4,
-    n_steps=2048,
-    batch_size=64,
-    n_epochs=10,
-    gamma=0.99,
-    verbose=1,
-):
-    """
-    Train a PPO agent on the API Routing environment.
+    total_timesteps: int = TOTAL_TIMESTEPS,
+    save_dir: Path = MODELS_DIR,
+    model_name: str = "ppo_api_orchestrator",
+    learning_rate: float = 3e-4,
+    n_steps: int = 2048,
+    batch_size: int = 64,
+    n_epochs: int = 10,
+    gamma: float = 0.99,
+) -> dict:
+    """Train PPO on APIRoutingEnv and return metrics dict."""
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    Args:
-        total_timesteps: Number of training steps
-        save_dir: Directory to save model and metrics
-        model_name: Name for the saved model file
-        learning_rate: PPO learning rate
-        n_steps: Steps per rollout collection
-        batch_size: Minibatch size for PPO
-        n_epochs: Number of optimization epochs per rollout
-        gamma: Discount factor
-        verbose: Verbosity level
+    # TensorBoard logging is optional — only enable if fully functional
+    tb_log = None
+    try:
+        import tensorboard  # noqa: F401
+        from torch.utils.tensorboard import SummaryWriter  # noqa: F401
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        tb_log = str(LOG_DIR)
+    except Exception:
+        logger.warning("TensorBoard not available — skipping TB logging.")
 
-    Returns:
-        Trained PPO model
-    """
-    os.makedirs(save_dir, exist_ok=True)
-
-    print("=" * 60)
-    print("🚀 Adaptive API Orchestrator — RL Training")
-    print("=" * 60)
-    print(f"  Algorithm:       PPO (Proximal Policy Optimization)")
-    print(f"  Total Timesteps: {total_timesteps:,}")
-    print(f"  Learning Rate:   {learning_rate}")
-    print(f"  Batch Size:      {batch_size}")
-    print(f"  Gamma:           {gamma}")
-    print(f"  Save Directory:  {save_dir}")
-    print("=" * 60)
-
-    # Create environment
-    env = APIRoutingEnv()
-    print("\n✅ Environment created successfully")
-    print(f"   Observation Space: {env.observation_space}")
-    print(f"   Action Space:      {env.action_space}")
-
-    # Create PPO model
+    vec_env = DummyVecEnv([lambda: Monitor(APIRoutingEnv())])
     model = PPO(
-        policy="MlpPolicy",
-        env=env,
-        learning_rate=learning_rate,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        n_epochs=n_epochs,
-        gamma=gamma,
-        verbose=0,  # We use our custom callback for logging
-        tensorboard_log=None,
-    )
-    print("\n✅ PPO model initialized")
-
-    # Setup callback
-    callback = TrainingMetricsCallback(
-        log_interval=500, save_path=save_dir, verbose=verbose
+        "MlpPolicy", vec_env, verbose=0,
+        tensorboard_log=tb_log,
+        learning_rate=learning_rate, n_steps=n_steps,
+        batch_size=batch_size, n_epochs=n_epochs, gamma=gamma,
     )
 
-    # Train
-    print("\n🏋️ Training started...\n")
-    model.learn(total_timesteps=total_timesteps, callback=callback)
-    print("\n✅ Training completed!")
+    callback = _EpisodeCallback(eval_freq=EVAL_FREQ)
+    logger.info("Starting PPO training for %d timesteps...", total_timesteps)
+    start_time = time.time()
+    model.learn(total_timesteps=total_timesteps, callback=callback, progress_bar=False)
+    elapsed = time.time() - start_time
 
-    # Save model
-    model_path = os.path.join(save_dir, model_name)
-    model.save(model_path)
-    print(f"\n💾 Model saved to: {model_path}.zip")
+    save_path = save_dir / f"{model_name}.zip"
+    model.save(str(save_path))
+    logger.info("Model saved to %s", save_path)
 
-    # Run a quick evaluation
-    print("\n📈 Quick Evaluation (5 episodes)...")
-    evaluate_quick(model, env, n_episodes=5)
+    rewards = [e["reward"] for e in callback.episodes] if callback.episodes else [0.0]
+    metrics = {
+        "total_timesteps": total_timesteps,
+        "mean_reward": float(np.mean(rewards)),
+        "std_reward": float(np.std(rewards)),
+        "training_time_seconds": round(elapsed, 2),
+        "episodes": callback.episodes,
+    }
 
-    env.close()
-    return model
+    metrics_path = save_dir / "training_metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    logger.info("Metrics saved to %s", metrics_path)
 
-
-def evaluate_quick(model, env, n_episodes=5):
-    """Run a quick evaluation of the trained model."""
-    total_rewards = []
-    total_successes = []
-
-    for ep in range(n_episodes):
-        obs, _ = env.reset()
-        episode_reward = 0
-        episode_successes = 0
-        steps = 0
-
-        while True:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            episode_reward += reward
-            episode_successes += int(info.get("success", False))
-            steps += 1
-
-            if terminated or truncated:
-                break
-
-        total_rewards.append(episode_reward)
-        total_successes.append(episode_successes / steps if steps > 0 else 0)
-        print(
-            f"  Episode {ep + 1}: "
-            f"Reward={episode_reward:+.2f}, "
-            f"Success Rate={total_successes[-1]:.1%}, "
-            f"Steps={steps}"
-        )
-
-    print(f"\n  Average Reward:       {np.mean(total_rewards):+.2f}")
-    print(f"  Average Success Rate: {np.mean(total_successes):.1%}")
+    vec_env.close()
+    return metrics
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Train the API Routing RL Agent")
-    parser.add_argument(
-        "--timesteps", type=int, default=10000, help="Total training timesteps"
-    )
-    parser.add_argument(
-        "--save-dir", type=str, default="./models", help="Model save directory"
-    )
-    parser.add_argument(
-        "--model-name",
-        type=str,
-        default="ppo_api_orchestrator",
-        help="Model filename",
-    )
-    parser.add_argument(
-        "--lr", type=float, default=3e-4, help="Learning rate"
-    )
-
-    args = parser.parse_args()
-
-    train_model(
-        total_timesteps=args.timesteps,
-        save_dir=args.save_dir,
-        model_name=args.model_name,
-        learning_rate=args.lr,
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    result = train_model()
+    print(f"\nTraining complete.")
+    print(f"  Mean reward : {result['mean_reward']:.4f}")
+    print(f"  Std reward  : {result['std_reward']:.4f}")
+    print(f"  Time        : {result['training_time_seconds']:.1f}s")
+    print(f"  Episodes    : {len(result['episodes'])}")

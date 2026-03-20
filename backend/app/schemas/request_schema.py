@@ -1,19 +1,16 @@
-from pydantic import BaseModel
-from typing import Optional, List
+"""Request Pydantic schemas for the app/ FastAPI layer."""
+from pydantic import BaseModel, Field
 
-class RLStateInput(BaseModel):
-    latency: float
-    cost: float
-    success_rate: float
-    system_load: float
-    previous_action: int
 
-class APIRequest(BaseModel):
-    api_category: str
-    api_name: str
-    system_load: float
+class StateInput(BaseModel):
+    latency: float = Field(..., ge=0, description="Normalized latency [0, 1]")
+    cost: float = Field(..., ge=0, description="Normalized cost [0, 1]")
+    success_rate: float = Field(..., ge=0, le=1, description="Rolling success rate [0, 1]")
+    system_load: float = Field(..., ge=0, description="System load factor [0, 3]")
+    previous_action: int = Field(..., ge=0, le=3, description="Previous action {0,1,2,3}")
+    api_name: str = Field(..., min_length=1, description="Target API name")
 
-class ExecuteRequest(BaseModel):
-    state: RLStateInput
-    api_category: str
-    api_name: str
+
+class SimulateRequest(BaseModel):
+    api_name: str = Field(..., min_length=1, description="API to simulate")
+    retry: bool = Field(default=False, description="Whether this is a retry attempt")

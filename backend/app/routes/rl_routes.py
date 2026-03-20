@@ -1,57 +1,114 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from app.schemas.request_schema import RLStateInput, ExecuteRequest
-from app.schemas.response_schema import RLDecisionResponse, ExecuteResponse
+"""RL decision routes — POST /rl/get-decision, /rl/execute, GET /rl/decisions, /rl/metrics"""
+import logging
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config.database import get_db
-from app.services.db_service import insert_rl_decision, insert_api_log
-from app.services.rl_agent import rl_agent_service
-from app.services.api_simulator import APISimulator
-from app.utils.helpers import action_to_string
+from app.schemas.request_schema import StateInput
+from app.schemas.response_schema import DecisionResponse
+from app.services.api_simulator import simulate_api
+from app.services.db_service import (
+    fetch_rl_decisions, fetch_training_metrics,
+    insert_api_log, insert_rl_decision,
+)
+from app.utils.helpers import InvalidAPIError, SimulationError, compute_reward
 
-router = APIRouter(prefix="/rl", tags=["RL Orchestration"])
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/rl", tags=["RL Agent"])
 
-@router.post("/get-decision", response_model=RLDecisionResponse)
-def get_decision(state: RLStateInput):
-    state_arr = [state.latency, state.cost, state.success_rate, state.system_load, state.previous_action]
-    action = rl_agent_service.get_action(state_arr)
-    action_str = action_to_string(action)
-    return RLDecisionResponse(action=action, action_name=action_str)
+_rl_agent = None
 
-@router.post("/execute", response_model=ExecuteResponse)
-def execute_pipeline(req: ExecuteRequest, db: Session = Depends(get_db)):
-    state_arr = [req.state.latency, req.state.cost, req.state.success_rate, req.state.system_load, req.state.previous_action]
-    action = rl_agent_service.get_action(state_arr)
-    action_str = action_to_string(action)
-    
-    api_res = None
-    reward = 0
-    actual_api = req.api_name
-    
-    if action == 2: # Skip
-        api_res = {"api_name": actual_api, "latency": 0, "cost": 0, "success": True, "skipped": True}
-        reward = -10
-    else:
-        is_retry = (action == 1)
-        if action == 3: # Switch
-            actual_api = "fallback_" + req.api_name
-        
-        api_res = APISimulator.call_api(req.api_category, actual_api, req.state.system_load, is_retry)
-        
-        lat_norm = min(api_res["latency"] / 1000.0, 1.0)
-        cost = api_res["cost"]
-        if api_res["success"]:
-            reward = 100 - (lat_norm * 10) - (cost * 5)
-        else:
-            reward = -50 - (lat_norm * 10) - (cost * 5)
-            
-        insert_api_log(db, f"{req.api_category}.{actual_api}", api_res["latency"], api_res["cost"], api_res["success"])
-        
-    state_dict = req.state.model_dump()
-    insert_rl_decision(db, state_dict, action_str, reward)
-    
-    return ExecuteResponse(
-        action=action,
-        action_name=action_str,
-        api_response=api_res,
-        reward=reward
+
+def _get_agent():
+    global _rl_agent
+    if _rl_agent is None:
+        from app.config.settings import settings
+        from app.services.rl_agent import RLAgent
+        _rl_agent = RLAgent(model_path=settings.MODEL_PATH)
+        _rl_agent.load_model()
+    return _rl_agent
+
+
+@router.post("/get-decision", response_model=DecisionResponse)
+async def get_decision(body: StateInput) -> DecisionResponse:
+    agent = _get_agent()
+    state = [body.latency, body.cost, body.success_rate, body.system_load, body.previous_action]
+    try:
+        result = agent.get_action_with_confidence(state)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="RL inference failed") from exc
+
+    return DecisionResponse(
+        action=result["action"],
+        action_int=result["action_int"],
+        confidence=result["confidence"],
     )
+
+
+@router.post("/execute")
+async def execute_pipeline(body: StateInput, db: AsyncSession = Depends(get_db)) -> dict[str, Any]:
+    agent = _get_agent()
+    state = [body.latency, body.cost, body.success_rate, body.system_load, body.previous_action]
+
+    try:
+        decision = agent.get_action_with_confidence(state)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"RL inference failed: {exc}") from exc
+
+    action_int = decision["action_int"]
+    retry = action_int == 1
+
+    try:
+        sim_result = simulate_api(body.api_name, retry=retry)
+    except InvalidAPIError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SimulationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    reward = compute_reward(sim_result, action_int)
+    logged = False
+
+    try:
+        sim_result["action_taken"] = decision["action"]
+        await insert_api_log(db, sim_result)
+        await insert_rl_decision(db, state, action_int, reward, body.api_name)
+        logged = True
+    except Exception as exc:
+        logger.warning("Failed to persist execute pipeline records: %s", exc)
+
+    return {
+        "action_taken": decision["action"],
+        "action_int": action_int,
+        "confidence": decision["confidence"],
+        "api_result": sim_result,
+        "reward": reward,
+        "logged": logged,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get("/decisions")
+async def get_decisions(
+    limit: int = Query(default=50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    try:
+        decisions = await fetch_rl_decisions(db, limit=limit)
+        return [d.to_dict() for d in decisions]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to fetch decisions") from exc
+
+
+@router.get("/metrics")
+async def get_metrics(
+    limit: int = Query(default=20, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    try:
+        metrics = await fetch_training_metrics(db, limit=limit)
+        return [m.to_dict() for m in metrics]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to fetch metrics") from exc

@@ -1,1 +1,4 @@
-# DB Package
+"""db — SQLite fallback connection layer."""
+from db.connection import get_db_connection
+
+__all__ = ["get_db_connection"]

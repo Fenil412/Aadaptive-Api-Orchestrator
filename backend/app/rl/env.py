@@ -1,92 +1,130 @@
+"""
+MicroserviceOrchestrationEnv — RL environment integrated with the FastAPI app layer.
+Registered as 'MicroserviceOrchestrator-v0'.
+"""
+import logging
+from collections import deque
+from typing import Any
+
 import gymnasium as gym
-from gymnasium import spaces
 import numpy as np
-import random
-from app.services.api_simulator import APISimulator
+from gymnasium import spaces
+
+logger = logging.getLogger(__name__)
+
+try:
+    from gymnasium.envs.registration import register
+    register(
+        id="MicroserviceOrchestrator-v0",
+        entry_point="app.rl.env:MicroserviceOrchestrationEnv",
+    )
+except Exception:
+    pass
+
 
 class MicroserviceOrchestrationEnv(gym.Env):
-    def __init__(self):
-        super(MicroserviceOrchestrationEnv, self).__init__()
-        
-        # Latency, cost, success_rate, load, previous_action
-        self.observation_space = spaces.Box(
-            low=np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0, 3.0, 1.0], dtype=np.float32),
-            dtype=np.float32
-        )
-        # 0: call, 1: retry, 2: skip, 3: switch
+    """
+    Gymnasium environment for microservice API orchestration.
+
+    Observation space (5-dim float32, all in [0, 1]):
+        [0] latency_norm     [1] cost_norm
+        [2] success_rate     [3] system_load / 3
+        [4] previous_action / 3
+
+    Action space: Discrete(4) — call_api(0), retry(1), skip(2), switch_provider(3)
+    Episode terminates after 50 steps or 3 consecutive failures.
+    """
+
+    metadata = {"render_modes": []}
+    MAX_STEPS = 50
+    MAX_CONSECUTIVE_FAILURES = 3
+    SUCCESS_WINDOW = 10
+    ACTION_LABELS = {0: "call_api", 1: "retry", 2: "skip", 3: "switch_provider"}
+
+    def __init__(self, api_name: str = "payment_A", render_mode: str | None = None):
+        super().__init__()
+        self.api_name = api_name
+        self.render_mode = render_mode
+
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(5,), dtype=np.float32)
         self.action_space = spaces.Discrete(4)
-        
-        self.current_step = 0
-        self.max_steps = 100
-        self.state = np.zeros(5, dtype=np.float32)
-        
-        self.episode_reward = 0
-        self.episode_latency = []
-        self.episode_successes = []
 
-    def reset(self, seed=None, options=None):
+        self._step_count = 0
+        self._consecutive_failures = 0
+        self._previous_action = 0
+        self._success_history: deque[float] = deque(maxlen=self.SUCCESS_WINDOW)
+        self._current_obs = np.zeros(5, dtype=np.float32)
+
+    def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
-        self.current_step = 0
-        self.episode_reward = 0
-        self.episode_latency = []
-        self.episode_successes = []
-        
-        self.state = np.array([0.0, 0.0, 1.0, random.uniform(0.5, 2.5), 0.0], dtype=np.float32)
-        return self.state, {}
+        self._step_count = 0
+        self._consecutive_failures = 0
+        self._previous_action = 0
+        self._success_history.clear()
+        for _ in range(self.SUCCESS_WINDOW):
+            self._success_history.append(1.0)
+        self._current_obs = self._make_obs(0.3, 0.3, 1.0)
+        return self._current_obs.copy(), {"step": 0, "api_name": self.api_name}
 
-    def step(self, action):
-        self.current_step += 1
-        action = int(action)
-        
-        _, _, success_rate, system_load, _ = self.state
-        
-        reward = 0
-        success = False
-        api_lat = 0
-        api_cost = 0
-        
-        if action == 2: # Skip
-            success = True
-            reward = -10
-        else:
-            category = "ecommerce"
-            api_name = "payment_A" if action != 3 else "payment_B" 
-            is_retry = (action == 1)
-            
-            res = APISimulator.call_api(category, api_name, system_load, is_retry)
-            success = res["success"]
-            api_lat = res["latency"]
-            api_cost = res["cost"]
-            
-            lat_norm = min(api_lat / 1000.0, 1.0)
-            
-            if success:
-                reward = 100 - (lat_norm * 10) - (api_cost * 5)
-            else:
-                reward = -50 - (lat_norm * 10) - (api_cost * 5)
-                
-        self.episode_reward += reward
-        self.episode_latency.append(api_lat)
-        self.episode_successes.append(1 if success else 0)
-        
-        new_latency = min(api_lat / 1000.0, 1.0)
-        new_cost = min(api_cost, 1.0)
-        new_success_rate = success_rate * 0.8 + (1.0 if success else 0.0) * 0.2
-        new_system_load = max(0.1, min(3.0, system_load + random.uniform(-0.2, 0.2)))
-        new_previous_action = action / 3.0
-        
-        self.state = np.array([new_latency, new_cost, new_success_rate, new_system_load, new_previous_action], dtype=np.float32)
-        
-        done = self.current_step >= self.max_steps
-        truncated = False
-        
-        info = {"api_latency": api_lat, "api_cost": api_cost, "success": success}
-        
-        return self.state, float(reward), done, truncated, info
+    def step(self, action: int):
+        from app.services.api_simulator import simulate_api
+        from app.utils.helpers import SimulationError
 
-gym.register(
-    id="MicroserviceOrchestrator-v0",
-    entry_point="app.rl.env:MicroserviceOrchestrationEnv",
-    max_episode_steps=100,
-)
+        self._step_count += 1
+        retry = action == 1
+
+        try:
+            result = simulate_api(self.api_name, retry=retry)
+            success = result["success"]
+            latency = result["latency"]
+            cost = result["cost"]
+            system_load = result["system_load"]
+        except SimulationError as exc:
+            logger.warning("SimulationError in env step: %s", exc)
+            success, latency, cost, system_load = False, 500.0, 5.0, 1.5
+
+        self._success_history.append(1.0 if success else 0.0)
+        self._consecutive_failures = 0 if success else self._consecutive_failures + 1
+
+        reward = self._compute_reward(latency, cost, success, action)
+        self._previous_action = action
+        self._current_obs = self._make_obs(
+            min(latency / 1000.0, 1.0), min(cost / 20.0, 1.0), system_load
+        )
+
+        terminated = self._consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES
+        truncated = self._step_count >= self.MAX_STEPS
+
+        info = {
+            "step": self._step_count,
+            "success": success,
+            "latency": latency,
+            "cost": cost,
+            "system_load": system_load,
+            "action_label": self.ACTION_LABELS.get(action, "unknown"),
+        }
+        return self._current_obs.copy(), reward, terminated, truncated, info
+
+    def _make_obs(self, latency_norm: float, cost_norm: float, system_load: float) -> np.ndarray:
+        success_rate = float(np.mean(self._success_history)) if self._success_history else 1.0
+        obs = np.array([
+            latency_norm, cost_norm, success_rate,
+            min(system_load / 3.0, 1.0), self._previous_action / 3.0,
+        ], dtype=np.float32)
+        return np.clip(obs, 0.0, 1.0)
+
+    def _compute_reward(self, latency: float, cost: float, success: bool, action: int) -> float:
+        reward = 100.0 if success else -50.0
+        reward -= latency * 0.10
+        reward -= cost * 5.0
+        if action == 1:
+            reward -= 10.0
+        elif action == 2:
+            reward -= 5.0
+        return reward
+
+    def render(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass

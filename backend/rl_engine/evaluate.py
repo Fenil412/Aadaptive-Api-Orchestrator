@@ -1,248 +1,137 @@
 """
-Evaluation script to compare the RL agent against static routing strategies.
-
-Runs multiple episodes with:
-  1. Trained PPO Agent
-  2. Random Routing (baseline)
-  3. Always-Cheapest (Provider C)
-  4. Always-Fastest (Provider A)
-  5. Round-Robin
-
-Outputs comparison metrics and generates plots.
+Evaluate a trained PPO model against static baseline strategies.
+Run from backend/ directory:
+    python -m rl_engine.evaluate --model models/ppo_api_orchestrator.zip
 """
-
-import os
-import sys
 import json
+import logging
+from pathlib import Path
+from typing import Any
+
 import numpy as np
-import matplotlib
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from datetime import datetime
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from stable_baselines3 import PPO
 from rl_engine.env import APIRoutingEnv
 
+logger = logging.getLogger(__name__)
 
-def evaluate_model(model_path, n_episodes=20, save_dir="./models"):
-    """
-    Evaluate the trained RL model against static strategies.
+STRATEGIES = ["ppo", "random", "always_a", "always_b", "always_c", "round_robin"]
+ACTION_LABELS = {0: "call_api", 1: "retry", 2: "skip", 3: "switch_provider"}
 
-    Args:
-        model_path: Path to the saved PPO model
-        n_episodes: Number of evaluation episodes
-        save_dir: Directory to save evaluation results
 
-    Returns:
-        Dictionary with comparison results
-    """
-    os.makedirs(save_dir, exist_ok=True)
+def _run_strategy(strategy: str, n_episodes: int, model=None) -> dict[str, Any]:
     env = APIRoutingEnv()
+    rewards, latencies, costs, successes = [], [], [], []
+    action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+    rr_counter = 0
 
-    # Load trained model
-    print("=" * 60)
-    print("📊 Adaptive API Orchestrator — Evaluation")
-    print("=" * 60)
+    for _ in range(n_episodes):
+        obs, _ = env.reset()
+        ep_reward = 0.0
+        done = False
 
-    model = PPO.load(model_path)
-    print(f"✅ Loaded model from: {model_path}")
+        while not done:
+            if strategy == "ppo" and model is not None:
+                action, _ = model.predict(obs.reshape(1, -1), deterministic=True)
+                action = int(action)
+            elif strategy == "random":
+                action = env.action_space.sample()
+            elif strategy == "always_a":
+                action = 0
+            elif strategy == "always_b":
+                action = 1
+            elif strategy == "always_c":
+                action = 2
+            elif strategy == "round_robin":
+                action = rr_counter % 4
+                rr_counter += 1
+            else:
+                action = 0
 
-    strategies = {
-        "PPO Agent": lambda obs, step: int(model.predict(obs, deterministic=True)[0]),
-        "Random": lambda obs, step: env.action_space.sample(),
-        "Always Fastest (A)": lambda obs, step: 0,
-        "Always Balanced (B)": lambda obs, step: 1,
-        "Always Cheapest (C)": lambda obs, step: 2,
-        "Round Robin": lambda obs, step: step % 4,
-    }
+            obs, reward, terminated, truncated, info = env.step(action)
+            ep_reward += reward
+            latencies.append(info.get("latency", 0.0))
+            costs.append(info.get("cost", 0.0))
+            successes.append(1.0 if info.get("success", False) else 0.0)
+            action_counts[action] = action_counts.get(action, 0) + 1
+            done = terminated or truncated
 
-    results = {}
-
-    for strategy_name, strategy_fn in strategies.items():
-        print(f"\n🔄 Evaluating: {strategy_name}...")
-        all_rewards = []
-        all_latencies = []
-        all_costs = []
-        all_successes = []
-        episode_rewards = []
-
-        for ep in range(n_episodes):
-            obs, _ = env.reset()
-            ep_reward = 0
-            step = 0
-
-            while True:
-                action = strategy_fn(obs, step)
-                obs, reward, terminated, truncated, info = env.step(action)
-                ep_reward += reward
-                all_rewards.append(reward)
-                all_latencies.append(info["latency"])
-                all_costs.append(info["cost"])
-                all_successes.append(float(info["success"]))
-                step += 1
-
-                if terminated or truncated:
-                    break
-
-            episode_rewards.append(ep_reward)
-
-        results[strategy_name] = {
-            "avg_episode_reward": float(np.mean(episode_rewards)),
-            "std_episode_reward": float(np.std(episode_rewards)),
-            "avg_reward_per_step": float(np.mean(all_rewards)),
-            "avg_latency": float(np.mean(all_latencies)),
-            "avg_cost": float(np.mean(all_costs)),
-            "success_rate": float(np.mean(all_successes)),
-            "episode_rewards": [float(r) for r in episode_rewards],
-        }
-
-        print(
-            f"   Avg Episode Reward: {results[strategy_name]['avg_episode_reward']:+.2f} "
-            f"(±{results[strategy_name]['std_episode_reward']:.2f})"
-        )
-        print(f"   Avg Latency:        {results[strategy_name]['avg_latency']:.3f}")
-        print(f"   Avg Cost:           {results[strategy_name]['avg_cost']:.3f}")
-        print(f"   Success Rate:       {results[strategy_name]['success_rate']:.1%}")
+        rewards.append(ep_reward)
 
     env.close()
+    total_actions = sum(action_counts.values()) or 1
 
-    # ── Print Comparison Table ──
-    print("\n" + "=" * 80)
-    print(f"{'Strategy':<25} {'Reward':>10} {'Latency':>10} {'Cost':>10} {'Success':>10}")
-    print("-" * 80)
-    for name, data in results.items():
-        print(
-            f"{name:<25} "
-            f"{data['avg_episode_reward']:>+10.2f} "
-            f"{data['avg_latency']:>10.3f} "
-            f"{data['avg_cost']:>10.3f} "
-            f"{data['success_rate']:>9.1%}"
-        )
-    print("=" * 80)
-
-    # ── Generate Comparison Plots ──
-    _generate_comparison_plots(results, save_dir)
-
-    # ── Save Results ──
-    results_path = os.path.join(save_dir, "evaluation_results.json")
-    serializable_results = {
-        k: {kk: vv for kk, vv in v.items()}
-        for k, v in results.items()
+    return {
+        "strategy": strategy,
+        "mean_reward": float(np.mean(rewards)),
+        "std_reward": float(np.std(rewards)),
+        "success_rate": float(np.mean(successes)),
+        "avg_latency": float(np.mean(latencies)),
+        "avg_cost": float(np.mean(costs)),
+        "action_distribution": {
+            ACTION_LABELS[k]: round(v / total_actions * 100, 2)
+            for k, v in action_counts.items()
+        },
     }
-    with open(results_path, "w") as f:
-        json.dump(serializable_results, f, indent=2)
-    print(f"\n💾 Results saved to: {results_path}")
-
-    return results
 
 
-def _generate_comparison_plots(results, save_dir):
-    """Generate comparison bar charts and save as images."""
-    strategies = list(results.keys())
-    colors = ["#6C5CE7", "#00B894", "#FDCB6E", "#E17055", "#0984E3", "#636E72"]
+def evaluate_model(
+    model_path: str,
+    n_episodes: int = 20,
+    save_dir: str | None = None,
+) -> dict[str, Any]:
+    """Load a PPO model and compare it against 5 static strategies."""
+    from stable_baselines3 import PPO
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(
-        "RL Agent vs Static Strategies — Comparison",
-        fontsize=16,
-        fontweight="bold",
-        color="#2D3436",
-    )
+    model = None
+    try:
+        model = PPO.load(model_path)
+        logger.info("Loaded model from %s", model_path)
+    except Exception as exc:
+        logger.warning("Could not load model: %s — PPO strategy will use random fallback.", exc)
 
-    # 1. Average Episode Reward
-    ax = axes[0, 0]
-    values = [results[s]["avg_episode_reward"] for s in strategies]
-    bars = ax.bar(strategies, values, color=colors, edgecolor="white", linewidth=0.5)
-    ax.set_title("Avg Episode Reward", fontweight="bold")
-    ax.set_ylabel("Reward")
-    ax.tick_params(axis="x", rotation=30)
-    for bar, val in zip(bars, values):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{val:+.1f}",
-            ha="center",
-            va="bottom",
-            fontsize=9,
+    results = {}
+    for strategy in STRATEGIES:
+        logger.info("Evaluating strategy: %s (%d episodes)", strategy, n_episodes)
+        results[strategy] = _run_strategy(
+            strategy=strategy,
+            n_episodes=n_episodes,
+            model=model if strategy == "ppo" else None,
         )
 
-    # 2. Average Latency
-    ax = axes[0, 1]
-    values = [results[s]["avg_latency"] for s in strategies]
-    bars = ax.bar(strategies, values, color=colors, edgecolor="white", linewidth=0.5)
-    ax.set_title("Avg Latency (lower is better)", fontweight="bold")
-    ax.set_ylabel("Latency")
-    ax.tick_params(axis="x", rotation=30)
-    for bar, val in zip(bars, values):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{val:.3f}",
-            ha="center",
-            va="bottom",
-            fontsize=9,
-        )
+    ppo_stats = results.get("ppo", {})
+    output = {
+        "mean_reward": ppo_stats.get("mean_reward", 0.0),
+        "std_reward": ppo_stats.get("std_reward", 0.0),
+        "success_rate": ppo_stats.get("success_rate", 0.0),
+        "avg_latency": ppo_stats.get("avg_latency", 0.0),
+        "avg_cost": ppo_stats.get("avg_cost", 0.0),
+        "action_distribution": ppo_stats.get("action_distribution", {}),
+        "strategy_comparison": results,
+    }
 
-    # 3. Average Cost
-    ax = axes[1, 0]
-    values = [results[s]["avg_cost"] for s in strategies]
-    bars = ax.bar(strategies, values, color=colors, edgecolor="white", linewidth=0.5)
-    ax.set_title("Avg Cost (lower is better)", fontweight="bold")
-    ax.set_ylabel("Cost")
-    ax.tick_params(axis="x", rotation=30)
-    for bar, val in zip(bars, values):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{val:.3f}",
-            ha="center",
-            va="bottom",
-            fontsize=9,
-        )
+    if save_dir:
+        out_path = Path(save_dir) / "evaluation_results.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            json.dump(output, f, indent=2)
+        logger.info("Evaluation results saved to %s", out_path)
 
-    # 4. Success Rate
-    ax = axes[1, 1]
-    values = [results[s]["success_rate"] * 100 for s in strategies]
-    bars = ax.bar(strategies, values, color=colors, edgecolor="white", linewidth=0.5)
-    ax.set_title("Success Rate (%)", fontweight="bold")
-    ax.set_ylabel("Success %")
-    ax.tick_params(axis="x", rotation=30)
-    for bar, val in zip(bars, values):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{val:.1f}%",
-            ha="center",
-            va="bottom",
-            fontsize=9,
-        )
-
-    plt.tight_layout()
-    plot_path = os.path.join(save_dir, "comparison_chart.png")
-    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"\n📉 Comparison chart saved to: {plot_path}")
+    return output
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Evaluate the trained RL agent")
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="./models/ppo_api_orchestrator.zip",
-        help="Path to saved model",
-    )
-    parser.add_argument(
-        "--episodes", type=int, default=20, help="Number of evaluation episodes"
-    )
-    parser.add_argument(
-        "--save-dir", type=str, default="./models", help="Results save directory"
-    )
-
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="models/ppo_api_orchestrator.zip")
+    parser.add_argument("--episodes", type=int, default=20)
+    parser.add_argument("--save-dir", default="models")
     args = parser.parse_args()
-    evaluate_model(args.model, args.episodes, args.save_dir)
+
+    results = evaluate_model(args.model, n_episodes=args.episodes, save_dir=args.save_dir)
+    print(f"\nPPO Agent Results:")
+    print(f"  Mean reward  : {results['mean_reward']:.4f}")
+    print(f"  Success rate : {results['success_rate']:.2%}")
+    print(f"  Avg latency  : {results['avg_latency']:.4f}")
+    print(f"  Avg cost     : {results['avg_cost']:.4f}")

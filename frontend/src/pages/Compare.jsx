@@ -35,12 +35,41 @@ export default function Compare() {
     loadResults();
   }, []);
 
+  // Map backend strategy keys → display names
+  const STRATEGY_NAME_MAP = {
+    ppo: 'PPO Agent',
+    random: 'Random',
+    always_a: 'Always Fastest (A)',
+    always_b: 'Always Balanced (B)',
+    always_c: 'Always Cheapest (C)',
+    round_robin: 'Round Robin',
+  };
+
+  function normalizeResults(data) {
+    // If data has strategy_comparison (real API shape), normalize it
+    if (data?.strategy_comparison) {
+      const normalized = {};
+      for (const [key, val] of Object.entries(data.strategy_comparison)) {
+        const name = STRATEGY_NAME_MAP[key] || key;
+        normalized[name] = {
+          avg_episode_reward: val.mean_reward ?? 0,
+          avg_latency: val.avg_latency ?? 0,
+          avg_cost: val.avg_cost ?? 0,
+          success_rate: val.success_rate ?? 0,
+        };
+      }
+      return normalized;
+    }
+    // Already in display shape (demo or cached)
+    return data;
+  }
+
   async function loadResults() {
     setLoading(true);
     try {
       const res = await getEvaluationResults();
       if (res.data && typeof res.data === 'object' && !res.data.message) {
-        setResults(res.data);
+        setResults(normalizeResults(res.data));
       } else {
         generateDemoResults();
       }
@@ -65,7 +94,7 @@ export default function Compare() {
     setEvaluating(true);
     try {
       const res = await runEvaluation(20);
-      setResults(res.data);
+      setResults(normalizeResults(res.data));
     } catch {
       generateDemoResults();
     }
@@ -79,10 +108,10 @@ export default function Compare() {
   const barData = strategies.map(name => ({
     name: name.length > 18 ? name.slice(0, 16) + '…' : name,
     fullName: name,
-    reward: results[name].avg_episode_reward,
-    latency: results[name].avg_latency,
-    cost: results[name].avg_cost,
-    successRate: (results[name].success_rate * 100),
+    reward: results[name].avg_episode_reward ?? 0,
+    latency: results[name].avg_latency ?? 0,
+    cost: results[name].avg_cost ?? 0,
+    successRate: ((results[name].success_rate ?? 0) * 100),
   }));
 
   // Radar data: normalize each metric
@@ -94,7 +123,7 @@ export default function Compare() {
     { metric: 'Success', ...Object.fromEntries(strategies.map(s => [s, (results[s].success_rate * 100)])) },
   ];
 
-  const ppoReward = results['PPO Agent']?.avg_episode_reward || 0;
+  const ppoReward = results['PPO Agent']?.avg_episode_reward || 1;
 
   return (
     <div className="page-container animate-fade-in">

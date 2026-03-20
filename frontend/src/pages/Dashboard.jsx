@@ -1,22 +1,16 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
-  LineChart, Line, AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
+  AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from 'recharts';
-import { Activity, DollarSign, Clock, CheckCircle2, TrendingUp } from 'lucide-react';
+import { Activity, DollarSign, Clock, CheckCircle2, TrendingUp, RefreshCcw } from 'lucide-react';
 import StatCard from '../components/StatCard';
 import ChartCard from '../components/ChartCard';
 import LoadingSpinner from '../components/LoadingSpinner';
-import { getDashboardStats, getTrainingMetrics, getRLDecisions } from '../services/api';
+import { getUIDashboard, getRLDecisions } from '../services/api';
 
-const PROVIDER_COLORS = {
-  'Call API': '#6366f1',
-  'Retry': '#10b981',
-  'Skip': '#f59e0b',
-  'Switch API': '#8b5cf6',
-  'Unknown': '#94a3b8'
-};
 const PIE_COLORS = ['#6366f1', '#10b981', '#f59e0b', '#8b5cf6'];
+const ACTION_LABELS = { 0: 'call_api', 1: 'retry', 2: 'skip', 3: 'switch_provider' };
 
 const tooltipStyle = {
   backgroundColor: 'rgba(17, 24, 39, 0.95)',
@@ -24,229 +18,192 @@ const tooltipStyle = {
   borderRadius: '10px',
   color: '#f1f5f9',
   fontSize: '12px',
-  fontFamily: "'Inter', sans-serif",
 };
 
 export default function Dashboard() {
-  const [stats, setStats] = useState(null);
-  const [metrics, setMetrics] = useState(null);
-  const [simData, setSimData] = useState(null);
+  const [dash, setDash] = useState(null);
+  const [decisions, setDecisions] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
-  useEffect(() => {
-    loadDashboard();
-  }, []);
-
-  async function loadDashboard() {
+  const load = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
-      const [statsRes, metricsRes, decRes] = await Promise.allSettled([
-        getDashboardStats(),
-        getTrainingMetrics(),
-        getRLDecisions(60)
+      const [dashRes, decRes] = await Promise.allSettled([
+        getUIDashboard(),
+        getRLDecisions(100),
       ]);
-
-      if (statsRes.status === 'fulfilled') setStats(statsRes.value.data);
-      if (metricsRes.status === 'fulfilled') setMetrics(metricsRes.value.data);
-
-      if (decRes.status === 'fulfilled' && decRes.value.data.length > 0) {
-        const decData = decRes.value.data;
-        const actionsMap = {0: 'Call API', 1: 'Retry', 2: 'Skip', 3: 'Switch API'};
-        const steps = decData.reverse().map((d, i) => {
-          const stateObj = typeof d.state === 'string' ? JSON.parse(d.state) : d.state;
-          return {
-            step: i + 1,
-            provider: actionsMap[parseInt(d.action)] || d.action,
-            latency: stateObj?.latency || 0,
-            cost: stateObj?.cost || 0,
-            success: (stateObj?.success_rate || 0) > 0.5,
-            reward: d.reward
-          };
-        });
-        setSimData({ steps });
-      } else {
-        generateDemoData();
-      }
-    } catch {
-      generateDemoData();
+      if (dashRes.status === 'fulfilled') setDash(dashRes.value.data);
+      else setError('Could not load dashboard stats from DB.');
+      if (decRes.status === 'fulfilled') setDecisions(decRes.value.data);
+    } catch (e) {
+      setError('Backend unreachable.');
     }
     setLoading(false);
-  }
+  }, []);
 
-  function generateDemoData() {
-    const providers = ['Call API', 'Retry', 'Skip', 'Switch API'];
-    const steps = Array.from({ length: 60 }, (_, i) => {
-      const provider = providers[Math.floor(Math.random() * 4)];
-      const success = Math.random() > 0.15;
-      return {
-        step: i + 1,
-        provider,
-        latency: +(0.05 + Math.random() * 0.7).toFixed(3),
-        cost: +(0.02 + Math.random() * 0.8).toFixed(3),
-        success,
-        reward: success ? +(0.2 + Math.random() * 0.6).toFixed(3) : +(-0.5 - Math.random() * 0.5).toFixed(3),
-      };
-    });
-    setSimData({ steps });
-  }
+  useEffect(() => { load(); }, [load]);
 
-  if (loading) return <LoadingSpinner text="Loading dashboard..." />;
+  if (loading) return <LoadingSpinner text="Loading dashboard from database..." />;
 
-  const steps = simData?.steps || [];
-  const rewardData = steps.map((s, i) => ({
-    step: s.step,
-    reward: s.reward,
-    avgReward: +(steps.slice(0, i + 1).reduce((a, b) => a + b.reward, 0) / (i + 1)).toFixed(3),
-  }));
-
-  const latencyCostData = steps.map(s => ({
-    step: s.step,
-    latency: s.latency,
-    cost: s.cost,
-  }));
-
-  const providerDist = {};
-  steps.forEach(s => { providerDist[s.provider] = (providerDist[s.provider] || 0) + 1; });
-  const pieData = Object.entries(providerDist).map(([name, value]) => ({ name, value }));
-
-  const providerPerf = {};
-  steps.forEach(s => {
-    if (!providerPerf[s.provider]) providerPerf[s.provider] = { rewards: [], latencies: [], count: 0 };
-    providerPerf[s.provider].rewards.push(s.reward);
-    providerPerf[s.provider].latencies.push(s.latency);
-    providerPerf[s.provider].count++;
+  // Build chart data from real RL decisions
+  const decisionRows = [...decisions].reverse();
+  const rewardData = decisionRows.map((d, i) => {
+    const r = d.reward ?? 0;
+    const running = decisionRows.slice(0, i + 1).reduce((s, x) => s + (x.reward ?? 0), 0) / (i + 1);
+    return { step: i + 1, reward: +r.toFixed(3), avgReward: +running.toFixed(3) };
   });
-  const barData = Object.entries(providerPerf).map(([name, data]) => ({
-    name: name,
-    avgReward: +(data.rewards.reduce((a, b) => a + b, 0) / data.count).toFixed(3),
-    avgLatency: +(data.latencies.reduce((a, b) => a + b, 0) / data.count).toFixed(3),
-  }));
 
-  const trendDir = stats?.recent_trend === 'improving' ? 'up' : stats?.recent_trend === 'declining' ? 'down' : 'stable';
+  const actionDist = {};
+  decisions.forEach(d => {
+    const label = ACTION_LABELS[d.action] ?? String(d.action);
+    actionDist[label] = (actionDist[label] || 0) + 1;
+  });
+  const pieData = Object.entries(actionDist).map(([name, value]) => ({ name, value }));
+
+  // Per-API bar from dashboard stats
+  const perApiBar = Object.entries(dash?.per_api_stats || {})
+    .sort((a, b) => b[1].total - a[1].total)
+    .slice(0, 8)
+    .map(([name, s]) => ({
+      name: name.length > 14 ? name.slice(0, 12) + '…' : name,
+      fullName: name,
+      calls: s.total,
+      successRate: +(s.success_rate * 100).toFixed(1),
+      avgLatency: +s.avg_latency.toFixed(1),
+    }));
 
   return (
     <div className="page-container animate-fade-in">
-      <div className="page-header">
-        <h1>
-          <span className="gradient-text">Dashboard</span>
-        </h1>
-        <p>Real-time overview of the RL-powered API routing system</p>
+      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+        <div>
+          <h1><span className="gradient-text">Dashboard</span></h1>
+          <p>Live overview from database — API logs &amp; RL decisions</p>
+        </div>
+        <button className="btn btn-secondary btn-sm" onClick={load}>
+          <RefreshCcw size={14} /> Refresh
+        </button>
       </div>
+
+      {error && (
+        <div style={{ padding: 14, background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: 10, color: '#ef4444', marginBottom: 20, fontSize: 13 }}>
+          ⚠ {error} — run <code>python -m app.utils.seed_db</code> or simulate some requests first.
+        </div>
+      )}
 
       <div className="stats-grid stagger-children">
-        <StatCard
-          icon={<Activity size={18} />}
-          label="Total Decisions"
-          value={stats?.total_requests?.toLocaleString() || '0'}
-          trend={stats?.requests_trend || 'N/A'}
-          trendDir={trendDir}
-          color="purple"
-        />
-        <StatCard
-          icon={<TrendingUp size={18} />}
-          label="Total Cost Impact"
-          value={stats?.total_cost?.toFixed(3) || '0.000'}
-          trend="Cumulative"
-          trendDir="up"
-          color="green"
-        />
-        <StatCard
-          icon={<Clock size={18} />}
-          label="Avg Latency"
-          value={stats?.avg_latency?.toFixed(3) || '0.000'}
-          trend="Normalized"
-          trendDir="down"
-          color="yellow"
-        />
-        <StatCard
-          icon={<DollarSign size={18} />}
-          label="Avg Cost"
-          value={stats?.avg_cost?.toFixed(3) || '0.000'}
-          trend="Per request"
-          trendDir="down"
-          color="red"
-        />
-        <StatCard
-          icon={<CheckCircle2 size={18} />}
-          label="Success Rate"
-          value={`${((stats?.success_rate || 0) * 100).toFixed(1)}%`}
-          trend="Overall"
-          trendDir="up"
-          color="blue"
-        />
+        <StatCard icon={<Activity size={18} />} label="Total API Calls" value={(dash?.total_calls ?? 0).toLocaleString()} trend="From DB" trendDir="up" color="purple" />
+        <StatCard icon={<CheckCircle2 size={18} />} label="Success Rate" value={`${((dash?.success_rate ?? 0) * 100).toFixed(1)}%`} trend="Overall" trendDir="up" color="green" />
+        <StatCard icon={<Clock size={18} />} label="Avg Latency" value={`${(dash?.avg_latency ?? 0).toFixed(1)} ms`} trend="Normalized" trendDir="down" color="yellow" />
+        <StatCard icon={<DollarSign size={18} />} label="Avg Cost" value={`$${(dash?.avg_cost ?? 0).toFixed(3)}`} trend="Per request" trendDir="down" color="red" />
+        <StatCard icon={<TrendingUp size={18} />} label="RL Decisions" value={decisions.length.toLocaleString()} trend="Logged" trendDir="up" color="blue" />
       </div>
 
-      <div className="charts-grid">
-        <ChartCard title="Reward Over Time" subtitle="Running average and per-step reward">
-          <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={rewardData}>
-              <defs>
-                <linearGradient id="rewardGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="5%" stopColor="#6366f1" stopOpacity={0.3} />
-                  <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
-                </linearGradient>
-              </defs>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
-              <XAxis dataKey="step" stroke="#64748b" fontSize={11} />
-              <YAxis stroke="#64748b" fontSize={11} />
-              <Tooltip contentStyle={tooltipStyle} />
-              <Area type="monotone" dataKey="avgReward" stroke="#6366f1" fill="url(#rewardGrad)" strokeWidth={2} name="Avg Reward" />
-              <Line type="monotone" dataKey="reward" stroke="#a78bfa" strokeWidth={1} dot={false} opacity={0.4} name="Step Reward" />
-            </AreaChart>
-          </ResponsiveContainer>
-        </ChartCard>
+      {decisions.length === 0 && !error && (
+        <div className="empty-state">
+          <div className="empty-state-icon">📊</div>
+          <div className="empty-state-title">No Data Yet</div>
+          <div className="empty-state-text">Go to Simulate to run API requests — data will appear here.</div>
+        </div>
+      )}
 
-        <ChartCard title="Latency vs Cost" subtitle="Per-step latency and cost metrics">
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={latencyCostData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
-              <XAxis dataKey="step" stroke="#64748b" fontSize={11} />
-              <YAxis stroke="#64748b" fontSize={11} />
-              <Tooltip contentStyle={tooltipStyle} />
-              <Legend wrapperStyle={{ fontSize: '12px' }} />
-              <Line type="monotone" dataKey="latency" stroke="#f59e0b" strokeWidth={2} dot={false} name="Latency" />
-              <Line type="monotone" dataKey="cost" stroke="#ef4444" strokeWidth={2} dot={false} name="Cost" />
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartCard>
+      {decisions.length > 0 && (
+        <div className="charts-grid">
+          <ChartCard title="RL Reward Over Time" subtitle="Per-decision reward from DB">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={rewardData}>
+                <defs>
+                  <linearGradient id="rg" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#6366f1" stopOpacity={0.3} />
+                    <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                <XAxis dataKey="step" stroke="#64748b" fontSize={11} />
+                <YAxis stroke="#64748b" fontSize={11} />
+                <Tooltip contentStyle={tooltipStyle} />
+                <Area type="monotone" dataKey="avgReward" stroke="#6366f1" fill="url(#rg)" strokeWidth={2} name="Avg Reward" />
+                <Area type="monotone" dataKey="reward" stroke="#a78bfa" fill="none" strokeWidth={1} opacity={0.4} name="Step Reward" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </ChartCard>
 
-        <ChartCard title="Action Distribution" subtitle="How requests are routed">
-          <ResponsiveContainer width="100%" height="100%">
-            <PieChart>
-              <Pie
-                data={pieData}
-                cx="50%"
-                cy="50%"
-                innerRadius={60}
-                outerRadius={100}
-                paddingAngle={4}
-                dataKey="value"
-                label={({ name, percent }) => `${name.split('(')[0].trim()} ${(percent * 100).toFixed(0)}%`}
-                labelLine={{ stroke: '#64748b' }}
-              >
-                {pieData.map((_, i) => (
-                  <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
-                ))}
-              </Pie>
-              <Tooltip contentStyle={tooltipStyle} />
-            </PieChart>
-          </ResponsiveContainer>
-        </ChartCard>
+          <ChartCard title="Action Distribution" subtitle="How the RL agent routes requests">
+            <ResponsiveContainer width="100%" height="100%">
+              <PieChart>
+                <Pie data={pieData} cx="50%" cy="50%" innerRadius={55} outerRadius={95} paddingAngle={4} dataKey="value"
+                  label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                  labelLine={{ stroke: '#64748b' }}>
+                  {pieData.map((_, i) => <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
+                </Pie>
+                <Tooltip contentStyle={tooltipStyle} />
+              </PieChart>
+            </ResponsiveContainer>
+          </ChartCard>
 
-        <ChartCard title="Action Performance" subtitle="Avg reward & latency by Action">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={barData}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
-              <XAxis dataKey="name" stroke="#64748b" fontSize={11} />
-              <YAxis stroke="#64748b" fontSize={11} />
-              <Tooltip contentStyle={tooltipStyle} />
-              <Legend wrapperStyle={{ fontSize: '12px' }} />
-              <Bar dataKey="avgReward" fill="#6366f1" radius={[4, 4, 0, 0]} name="Avg Reward" />
-              <Bar dataKey="avgLatency" fill="#f59e0b" radius={[4, 4, 0, 0]} name="Avg Latency" />
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
-      </div>
+          {perApiBar.length > 0 && (
+            <ChartCard title="API Call Volume" subtitle="Total calls per API endpoint (from DB)">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={perApiBar}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                  <XAxis dataKey="name" stroke="#64748b" fontSize={10} />
+                  <YAxis stroke="#64748b" fontSize={11} />
+                  <Tooltip contentStyle={tooltipStyle} formatter={(v, n, p) => [v, p.payload.fullName || n]} />
+                  <Legend wrapperStyle={{ fontSize: '12px' }} />
+                  <Bar dataKey="calls" fill="#6366f1" radius={[4, 4, 0, 0]} name="Total Calls" />
+                  <Bar dataKey="successRate" fill="#10b981" radius={[4, 4, 0, 0]} name="Success %" />
+                </BarChart>
+              </ResponsiveContainer>
+            </ChartCard>
+          )}
+
+          {perApiBar.length > 0 && (
+            <ChartCard title="Avg Latency by API" subtitle="Milliseconds per endpoint">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={perApiBar}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />
+                  <XAxis dataKey="name" stroke="#64748b" fontSize={10} />
+                  <YAxis stroke="#64748b" fontSize={11} />
+                  <Tooltip contentStyle={tooltipStyle} formatter={(v, n, p) => [`${v} ms`, p.payload.fullName || n]} />
+                  <Bar dataKey="avgLatency" fill="#f59e0b" radius={[4, 4, 0, 0]} name="Avg Latency (ms)" />
+                </BarChart>
+              </ResponsiveContainer>
+            </ChartCard>
+          )}
+        </div>
+      )}
+
+      {/* Recent Decisions Table */}
+      {decisions.length > 0 && (
+        <div className="logs-table-wrapper" style={{ marginTop: 24 }}>
+          <div className="chart-card-title" style={{ padding: '16px 20px 0' }}>Recent RL Decisions</div>
+          <table className="logs-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Timestamp</th>
+                <th>API</th>
+                <th>Action</th>
+                <th>Reward</th>
+              </tr>
+            </thead>
+            <tbody>
+              {decisions.slice(0, 15).map((d, i) => (
+                <tr key={d.id || i}>
+                  <td>{d.id || i + 1}</td>
+                  <td>{d.timestamp ? new Date(d.timestamp).toLocaleString() : '—'}</td>
+                  <td><span className="provider-badge">{d.api_name || '—'}</span></td>
+                  <td><span className="provider-badge">{ACTION_LABELS[d.action] ?? d.action}</span></td>
+                  <td style={{ color: (d.reward ?? 0) >= 0 ? '#10b981' : '#ef4444', fontWeight: 700 }}>
+                    {(d.reward ?? 0) >= 0 ? '+' : ''}{(d.reward ?? 0).toFixed(2)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

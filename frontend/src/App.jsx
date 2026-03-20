@@ -7,32 +7,32 @@ import Logs from './pages/Logs';
 import Compare from './pages/Compare';
 import Metrics from './pages/Metrics';
 import Train from './pages/Train';
-import Settings from './pages/Settings';
+import ApiExplorer from './pages/ApiExplorer';
 import { healthCheck } from './services/api';
 import './App.css';
 
 export default function App() {
-  const [modelLoaded, setModelLoaded] = useState(false);
+  const [health, setHealth] = useState({ model_loaded: false, db_connected: false, status: 'unknown' });
 
   useEffect(() => {
     healthCheck()
-      .then(res => setModelLoaded(res.data?.model_loaded || false))
-      .catch(() => setModelLoaded(false));
+      .then(res => setHealth(res.data || {}))
+      .catch(() => setHealth({ model_loaded: false, db_connected: false, status: 'offline' }));
   }, []);
 
   return (
     <BrowserRouter>
       <div className="app-layout">
-        <Sidebar modelLoaded={modelLoaded} />
+        <Sidebar health={health} />
         <main className="main-content">
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/simulate" element={<Simulate />} />
+            <Route path="/explorer" element={<ApiExplorer />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/compare" element={<Compare />} />
             <Route path="/metrics" element={<Metrics />} />
             <Route path="/train" element={<Train />} />
-            <Route path="/settings" element={<Settings />} />
           </Routes>
         </main>
       </div>

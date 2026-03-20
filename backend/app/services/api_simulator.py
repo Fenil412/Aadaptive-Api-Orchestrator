@@ -1,67 +1,73 @@
+"""
+API Simulator — simulates 16 APIs across 5 categories with realistic latency/cost/success.
+"""
+import logging
 import random
+from typing import Any
 
-API_ECOSYSTEM = {
-    "ecommerce": {
-        "payment_A": {"latency_range": (50, 200), "success_prob": 0.95, "cost": 0.05},
-        "payment_B": {"latency_range": (100, 300), "success_prob": 0.99, "cost": 0.10},
-        "inventory": {"latency_range": (20, 100), "success_prob": 0.98, "cost": 0.01},
-        "cart": {"latency_range": (10, 50), "success_prob": 0.99, "cost": 0.01},
-        "order": {"latency_range": (150, 400), "success_prob": 0.90, "cost": 0.05},
-        "recommendation": {"latency_range": (200, 800), "success_prob": 0.85, "cost": 0.08},
-    },
-    "user": {
-        "authentication": {"latency_range": (50, 150), "success_prob": 0.99, "cost": 0.02},
-        "profile": {"latency_range": (20, 80), "success_prob": 0.99, "cost": 0.01},
-        "preferences": {"latency_range": (10, 50), "success_prob": 0.99, "cost": 0.01},
-    },
-    "logistics": {
-        "delivery": {"latency_range": (200, 500), "success_prob": 0.92, "cost": 0.10},
-        "tracking": {"latency_range": (100, 300), "success_prob": 0.95, "cost": 0.02},
-        "warehouse": {"latency_range": (50, 200), "success_prob": 0.98, "cost": 0.03},
-    },
-    "financial": {
-        "fraud_detection": {"latency_range": (300, 1000), "success_prob": 0.99, "cost": 0.15},
-        "billing": {"latency_range": (150, 400), "success_prob": 0.95, "cost": 0.05},
-    },
-    "external": {
-        "external_payment": {"latency_range": (400, 1200), "success_prob": 0.85, "cost": 0.20},
-        "external_shipping": {"latency_range": (300, 900), "success_prob": 0.80, "cost": 0.15},
-    }
+from app.utils.helpers import InvalidAPIError, SimulationError
+
+logger = logging.getLogger(__name__)
+
+API_CONFIG: dict[str, dict[str, Any]] = {
+    # E-commerce
+    "payment_A":         {"latency": (100, 300), "success_prob": 0.95, "cost": 5.0},
+    "payment_B":         {"latency": (150, 400), "success_prob": 0.92, "cost": 4.0},
+    "inventory":         {"latency": (50,  200), "success_prob": 0.98, "cost": 1.5},
+    "cart":              {"latency": (40,  150), "success_prob": 0.99, "cost": 1.0},
+    "order":             {"latency": (80,  250), "success_prob": 0.96, "cost": 2.5},
+    "recommendation":    {"latency": (200, 600), "success_prob": 0.90, "cost": 3.0},
+    # User Services
+    "authentication":    {"latency": (30,  100), "success_prob": 0.99, "cost": 0.5},
+    "profile":           {"latency": (40,  120), "success_prob": 0.98, "cost": 0.8},
+    "preferences":       {"latency": (35,  110), "success_prob": 0.97, "cost": 0.7},
+    # Logistics
+    "delivery":          {"latency": (100, 350), "success_prob": 0.93, "cost": 3.5},
+    "tracking":          {"latency": (60,  200), "success_prob": 0.96, "cost": 2.0},
+    "warehouse":         {"latency": (80,  300), "success_prob": 0.94, "cost": 2.8},
+    # Financial
+    "fraud_detection":   {"latency": (200, 500), "success_prob": 0.97, "cost": 6.0},
+    "billing":           {"latency": (100, 300), "success_prob": 0.95, "cost": 4.5},
+    # External
+    "external_payment":  {"latency": (300, 800), "success_prob": 0.88, "cost": 7.0},
+    "external_shipping": {"latency": (250, 700), "success_prob": 0.87, "cost": 6.5},
 }
 
-class APISimulator:
-    @staticmethod
-    def call_api(category: str, api_name: str, system_load: float = 1.0, is_retry: bool = False):
-        if category not in API_ECOSYSTEM or api_name not in API_ECOSYSTEM[category]:
-            return {"api_name": api_name, "latency": 0, "cost": 0, "success": False, "error": "API not found"}
-        
-        profile = API_ECOSYSTEM[category][api_name]
-        
-        min_lat, max_lat = profile["latency_range"]
-        base_latency = random.uniform(min_lat, max_lat)
-        latency = base_latency * (1 + (system_load - 1) * 0.5)
-        
-        success_prob = profile["success_prob"]
-        if system_load > 1.5:
-            success_prob -= 0.1
-            
-        if is_retry:
-            latency *= 1.1
-            success_prob += 0.05
-            
-        success_prob = max(0.01, min(0.99, success_prob))
-        success = random.random() < success_prob
-        
-        if not success:
-            latency = max_lat * system_load
-            
-        cost = profile["cost"]
-        if is_retry:
-            cost *= 1.5
-            
-        return {
-            "api_name": api_name,
-            "latency": round(latency, 2),
-            "cost": round(cost, 4),
-            "success": success
-        }
+
+def simulate_api(api_name: str, retry: bool = False) -> dict[str, Any]:
+    """
+    Simulate an API call and return performance metrics.
+
+    Raises:
+        InvalidAPIError: Unknown api_name.
+        SimulationError: 5% global catastrophic failure chance.
+    """
+    if api_name not in API_CONFIG:
+        raise InvalidAPIError(
+            f"Unknown API: '{api_name}'. Valid: {list(API_CONFIG.keys())}"
+        )
+
+    # 5% global catastrophic failure
+    if random.random() < 0.05:
+        logger.warning("Catastrophic failure triggered for api=%s", api_name)
+        raise SimulationError(f"Catastrophic failure while calling '{api_name}'")
+
+    cfg = API_CONFIG[api_name]
+    lat_min, lat_max = cfg["latency"]
+    system_load = random.uniform(0.8, 1.5)
+
+    latency = random.uniform(lat_min, lat_max) * system_load
+    if retry:
+        latency += 20.0
+
+    success = random.random() < cfg["success_prob"]
+
+    result = {
+        "api_name": api_name,
+        "latency": round(latency, 3),
+        "cost": cfg["cost"],
+        "success": success,
+        "system_load": round(system_load, 4),
+    }
+    logger.debug("simulate_api: %s", result)
+    return result

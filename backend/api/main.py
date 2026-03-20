@@ -1,92 +1,127 @@
 """
-Adaptive API Orchestrator — FastAPI Application Entry Point.
+Single FastAPI application — port 8000.
+Includes ALL routes: simulation, RL decisions, UI dashboard, training, evaluation.
 
-Run with:
-    cd backend
-    uvicorn api.main:app --reload --port 8000
+Run from backend/ directory:
+    uvicorn api.main:app --port 8000 --reload
 """
-
+import json
+import logging
 import os
-import sys
+import time
 from contextlib import asynccontextmanager
-from dotenv import load_dotenv
-from fastapi import FastAPI
+from typing import Any
+
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
 
-# Add backend to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from api.models import HealthResponse
+from api.routes import router as primary_router
 
-load_dotenv()
+logger = logging.getLogger(__name__)
 
-from api.routes import router
+API_KEY = os.getenv("API_KEY", "")
+CORS_ORIGINS_RAW = os.getenv("CORS_ORIGINS", '["http://localhost:3000","http://localhost:5173"]')
+try:
+    CORS_ORIGINS = json.loads(CORS_ORIGINS_RAW)
+except Exception:
+    CORS_ORIGINS = ["http://localhost:3000", "http://localhost:5173"]
+
+_model_loaded = False
+_db_connected = False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application startup and shutdown events."""
-    # ── Startup ──
-    print("\n" + "=" * 50)
-    print("🚀 Adaptive API Orchestrator — Starting Up")
-    print("=" * 50)
+    global _model_loaded, _db_connected
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logger.info("Starting up (port 8000)")
 
-    # Try to initialize database
+    # Init async DB tables
     try:
-        from db.connection import init_database
-        init_database()
-    except Exception as e:
-        print(f"⚠️  Database not available: {e}")
-        print("   Running in memory-only mode")
+        from app.config.database import create_all_tables
+        await create_all_tables()
+        _db_connected = True
+        logger.info("Database tables ready.")
+    except Exception as exc:
+        logger.warning("DB init failed (continuing without DB): %s", exc)
 
-    # Preload model if exists
-    model_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "models",
-        "ppo_api_orchestrator.zip",
-    )
-    if os.path.exists(model_path):
-        print(f"✅ Trained model found at: {model_path}")
-    else:
-        print(f"⚠️  No trained model found. Use POST /train to train one.")
-
-    print("=" * 50 + "\n")
+    # Preload RL model
+    try:
+        from api.routes import _get_env_and_model
+        _, model = _get_env_and_model()
+        _model_loaded = model is not None
+    except Exception as exc:
+        logger.warning("Model preload failed: %s", exc)
 
     yield
-
-    # ── Shutdown ──
-    print("\n👋 Shutting down Adaptive API Orchestrator")
+    logger.info("Shutdown complete.")
 
 
-# ── Create FastAPI App ──
 app = FastAPI(
-    title="Adaptive API Orchestrator",
-    description=(
-        "An RL-powered API gateway that uses PPO (Proximal Policy Optimization) "
-        "to intelligently route API requests based on latency, cost, and "
-        "reliability metrics."
-    ),
+    title="RL API Orchestration",
+    description="PPO-based intelligent API routing system — all endpoints on port 8000.",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
 )
 
-# ── CORS Middleware ──
-cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Register Routes ──
-app.include_router(router)
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next) -> Response:
+    skip = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
+    if API_KEY and request.url.path not in skip:
+        if request.headers.get("X-API-Key", "") != API_KEY:
+            return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+    return await call_next(request)
 
 
-if __name__ == "__main__":
-    import uvicorn
+@app.middleware("http")
+async def logging_middleware(request: Request, call_next) -> Response:
+    start = time.perf_counter()
+    response = await call_next(request)
+    ms = round((time.perf_counter() - start) * 1000, 2)
+    response.headers["X-Response-Time-Ms"] = str(ms)
+    logger.info(json.dumps({"method": request.method, "path": request.url.path,
+                             "status": response.status_code, "ms": ms}))
+    return response
 
-    host = os.getenv("BACKEND_HOST", "0.0.0.0")
-    port = int(os.getenv("BACKEND_PORT", "8000"))
-    uvicorn.run("api.main:app", host=host, port=port, reload=True)
+
+# ── Primary routes (simulation, training, evaluation, logs) ──────────────────
+app.include_router(primary_router)
+
+# ── App routes (RL decisions, UI dashboard) ──────────────────────────────────
+try:
+    from app.routes.api_routes import router as app_api_router
+    from app.routes.rl_routes import router as rl_router
+    from app.routes.ui_routes import router as ui_router
+    app.include_router(app_api_router)
+    app.include_router(rl_router)
+    app.include_router(ui_router)
+    logger.info("App sub-routers registered: /api, /rl, /ui")
+except Exception as exc:
+    logger.warning("Could not register app sub-routers: %s", exc)
+
+
+@app.get("/", include_in_schema=False)
+async def root() -> RedirectResponse:
+    return RedirectResponse(url="/docs")
+
+
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
+async def health() -> HealthResponse:
+    return HealthResponse(
+        status="ok",
+        model_loaded=_model_loaded,
+        db_connected=_db_connected,
+        version="1.0.0",
+        env=os.getenv("APP_ENV", "development"),
+    )
